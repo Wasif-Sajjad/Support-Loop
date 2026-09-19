@@ -29,6 +29,7 @@ from app.llm.base import LLMProvider
 from app.schemas import (
     ClassificationResult,
     CriticVerdict,
+    CriticVerdictWithTrace,
     DraftResolution,
     EntailmentResult,
     EntailmentStepTrace,
@@ -65,15 +66,17 @@ You are a citation auditor. You will be shown:
   1. A drafted support answer.
   2. A knowledge base passage that was cited in that answer.
 
-Your job: decide whether the passage actually supports the claims made in the answer.
+Your job: decide whether the passage provides factual support for the drafted answer.
 
 Return ONLY a JSON object with exactly two keys:
-  - supported (boolean): true if the passage directly supports the answer's claims,
-    false if it is off-topic, only tangentially related, or contradicts the answer.
+  - supported (boolean): true if the passage provides source material for AT LEAST ONE 
+    claim in the answer. It does not need to support the entire answer (other passages 
+    might cover the rest). False ONLY if it is completely off-topic, unused, or contradicted.
   - reason (string): one or two sentences explaining your decision.
 
 Do not consider whether the answer is generally correct — only whether THIS passage
-supports THIS answer. Return ONLY valid JSON, no markdown fences.
+was actually used as factual grounding for some part of the answer.
+Return ONLY valid JSON, no markdown fences.
 """
 
 
@@ -134,83 +137,127 @@ async def escalation_critic(
     draft: DraftResolution,
     retrieved_chunks: list[RetrievedChunk],
     llm: LLMProvider,
-) -> CriticVerdict:
+) -> CriticVerdictWithTrace:
     """Decide whether a drafted answer should be auto-resolved or escalated.
 
     Applies three checks in strict priority order:
 
-    1. (E2) Hard policy denylist: some intents always escalate.
-    2. (E3) Confidence floor + citation presence: escalate if below threshold.
-    3. (E1) Citation entailment: make a real LLM call to verify at least one
-       cited chunk actually supports the answer.
+    1. (E2) Hard policy denylist: some intents always escalate. No LLM call.
+    2. (E3) Confidence floor + citation presence: escalate if below threshold. No LLM call.
+    3. (E1) Citation entailment: LLM call for EVERY cited chunk. Escalates if ANY
+       chunk fails. This fixes the original bug where only the first chunk was checked.
 
     Args:
         classification: Output of the classifier agent.
         draft: Output of the drafter agent.
-        retrieved_chunks: The chunks returned by the retriever (needed to look up
+        retrieved_chunks: The chunks returned by the retriever (used to look up
             cited chunk content for the entailment check).
         llm: An LLMProvider instance (via app.llm.base.get_provider).
 
     Returns:
-        A CriticVerdict (decision, reason, citation_supported).
+        A CriticVerdictWithTrace — the verdict plus every (chunk, EntailmentResult)
+        pair checked, so the caller can persist EntailmentTrace rows and assemble
+        the full TicketTrace.entailment_steps.
     """
+    def _short_circuit(verdict: CriticVerdict) -> CriticVerdictWithTrace:
+        """Return a verdict with an empty entailment list (pre-entailment escalation)."""
+        return CriticVerdictWithTrace(verdict=verdict, entailment_results=[])
+
     # --- Check 1 (E2): Hard policy denylist ---
     if classification.intent in POLICY_DENYLIST_INTENTS:
-        return CriticVerdict(
+        return _short_circuit(CriticVerdict(
             decision="escalate",
             reason=f"Policy denylist: intent '{classification.intent}' always requires human review",
             citation_supported=False,
-        )
+        ))
 
     # --- Check 2 (E3): Confidence floor + citation presence ---
     threshold = STRICTER_THRESHOLD_INTENTS.get(
         classification.intent, settings.confidence_threshold
     )
     if not draft.cited_chunk_ids or draft.confidence < threshold:
-        return CriticVerdict(
+        return _short_circuit(CriticVerdict(
             decision="escalate",
             reason=(
                 f"Confidence {draft.confidence:.2f} below threshold {threshold} "
                 f"or no supporting citation"
             ),
             citation_supported=bool(draft.cited_chunk_ids),
-        )
+        ))
 
-    # --- Check 3 (E1): Citation entailment ---
-    # Build a lookup map so we can retrieve chunk content by ID.
+    # --- Check 3 (E1): Citation entailment — check EVERY cited chunk ---
     chunk_map: dict[str, RetrievedChunk] = {
         str(c.chunk_id): c for c in retrieved_chunks
     }
 
-    # Check the first cited chunk. If the answer has multiple citations we check
-    # the first one; a future tuning story (Epic E1 follow-up) can check all.
-    first_cited_id = str(draft.cited_chunk_ids[0])
-    cited_chunk = chunk_map.get(first_cited_id)
+    entailment_results: list[tuple[RetrievedChunk, EntailmentResult]] = []
+    hallucinated_ids: list[str] = []
 
-    if cited_chunk is None:
-        # The cited ID doesn't match any retrieved chunk — the LLM hallucinated an ID.
-        return CriticVerdict(
-            decision="escalate",
-            reason=(
-                f"Cited chunk ID {first_cited_id} was not in the retrieved set — "
-                "possible hallucination."
+    for cited_id in draft.cited_chunk_ids:
+        cited_id_str = str(cited_id)
+        chunk = chunk_map.get(cited_id_str)
+
+        if chunk is None:
+            # This cited ID was not in the retrieved set — hallucinated.
+            hallucinated_ids.append(cited_id_str)
+            continue
+
+        result = await entailment_check(draft.answer, chunk, llm)
+        entailment_results.append((chunk, result))
+
+    # Any hallucinated IDs → immediate escalation (no entailment possible).
+    if hallucinated_ids:
+        return CriticVerdictWithTrace(
+            verdict=CriticVerdict(
+                decision="escalate",
+                reason=(
+                    f"{len(hallucinated_ids)} cited chunk ID(s) were not in the retrieved "
+                    f"set — possible hallucination: {', '.join(hallucinated_ids[:3])}"
+                ),
+                citation_supported=False,
             ),
-            citation_supported=False,
+            entailment_results=entailment_results,
         )
 
-    entailment = await entailment_check(draft.answer, cited_chunk, llm)
-
-    if not entailment.supported:
-        return CriticVerdict(
-            decision="escalate",
-            reason=f"Citation entailment failed: {entailment.reason}",
-            citation_supported=False,
+    # If no entailment results (all IDs hallucinated OR draft had no citations after
+    # the confidence check — shouldn't happen but guard anyway).
+    if not entailment_results:
+        return CriticVerdictWithTrace(
+            verdict=CriticVerdict(
+                decision="escalate",
+                reason="No valid cited chunks could be entailment-checked.",
+                citation_supported=False,
+            ),
+            entailment_results=[],
         )
 
-    return CriticVerdict(
-        decision="auto_resolve",
-        reason=f"Passed all checks. Entailment: {entailment.reason}",
-        citation_supported=True,
+    # Find the first failing chunk (if any).
+    failing = [(chunk, r) for chunk, r in entailment_results if not r.supported]
+
+    if failing:
+        fail_chunk, fail_result = failing[0]
+        return CriticVerdictWithTrace(
+            verdict=CriticVerdict(
+                decision="escalate",
+                reason=(
+                    f"Entailment failed for chunk {fail_chunk.chunk_id}: "
+                    f"{fail_result.reason} "
+                    f"({len(failing)}/{len(entailment_results)} chunks failed)"
+                ),
+                citation_supported=False,
+            ),
+            entailment_results=entailment_results,
+        )
+
+    # All chunks passed.
+    passed_summary = "; ".join(r.reason[:80] for _, r in entailment_results[:2])
+    return CriticVerdictWithTrace(
+        verdict=CriticVerdict(
+            decision="auto_resolve",
+            reason=f"All {len(entailment_results)} citation(s) passed entailment. {passed_summary}",
+            citation_supported=True,
+        ),
+        entailment_results=entailment_results,
     )
 
 

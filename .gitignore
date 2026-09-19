@@ -1,17 +1,46 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environments & Secrets
 .env
+.env.*
+!.env.example
 .venv/
 venv/
+env/
+ENV/
+
+# Node & Next.js
 node_modules/
 .next/
-dist/
-*.egg-info/
-.pytest_cache/
+out/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# KB Data & Cache
 data/kb/**
 !data/kb/**/.gitkeep
-.DS_Store
-
-# HuggingFace Datasets Cache
 .cache/
-~/.cache/huggingface/datasets/gitkeep
+~/.cache/
+
+# Agent & IDE
+.agents/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS & Logs
+*.log
+.DS_Store
+Thumbs.db
+desktop.ini

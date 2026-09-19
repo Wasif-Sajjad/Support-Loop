@@ -1,7 +1,7 @@
 """Epic B1/B2 — ingest KB documents from data/kb/, chunk, embed, load into pgvector.
 
-Run inside Docker:  docker compose exec backend python scripts/seed_kb.py
-Run locally:        python scripts/seed_kb.py  (from backend/ dir, with .env loaded)
+Run inside Docker:  docker compose exec backend sh -c "PYTHONPATH=/app python scripts/seed_kb.py"
+Run locally:        cd backend && PYTHONPATH=. python scripts/seed_kb.py
 
 Intent coverage for ingestion (10 intents):
   ACCOUNT / CONTACT / FEEDBACK intents (9 Bitext intents):
@@ -29,7 +29,15 @@ intentional scope — remove them or add a new intent before seeding.
 """
 import asyncio
 import glob
+import sys
+import os
 import uuid
+
+# Ensure the backend package root is on sys.path regardless of how the script is invoked.
+# This lets `from app.xxx import ...` work both locally and inside the Docker container.
+_BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _BACKEND_ROOT not in sys.path:
+    sys.path.insert(0, _BACKEND_ROOT)
 
 from sentence_transformers import SentenceTransformer
 from sqlalchemy import text

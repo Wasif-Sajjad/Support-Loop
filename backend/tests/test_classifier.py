@@ -27,7 +27,7 @@ def _load_holdout() -> list[dict]:
         f"classifier_holdout.csv not found at {path}. "
         "Run from the backend/ directory or the repo root."
     )
-    with open(path, newline="", encoding="utf-8") as f:
+    with open(path, newline="", encoding="utf-8-sig") as f:
         return list(csv.DictReader(f))
 
 

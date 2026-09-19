@@ -12,8 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.db import get_db
-from app.models import Ticket, AgentTrace
-from app.schemas import TicketCreate, TicketResponse, TicketTrace
+from app.models import Ticket, AgentTrace, EntailmentTrace
+from app.schemas import TicketCreate, TicketResponse, TicketTrace, EntailmentStepTrace
 from app.config import settings
 from app.llm.base import get_provider
 from app.agents.graph import build_graph
@@ -22,37 +22,36 @@ from app.cache import set_cached_answer
 router = APIRouter(prefix="/tickets", tags=["tickets"])
 
 
+from langfuse import observe, get_client
+langfuse_client = get_client()
+
 @router.post("", response_model=TicketResponse)
+@observe(name="ticket_resolution")
 async def create_ticket(
     payload: TicketCreate,
     db: AsyncSession = Depends(get_db),
 ) -> TicketResponse:
-    """Submit a raw ticket, run the full agent pipeline, persist the result.
-
-    The pipeline runs synchronously in the request (acceptable for async
-    support workflows — p50 < 5s per NFR5). A background task queue can be
-    added later without changing this interface.
-
-    Args:
-        payload: TicketCreate with raw_text and optional channel.
-        db: Injected async DB session.
-
-    Returns:
-        The persisted ticket record with intent, decision, and final_answer.
-    """
+    """Submit a raw ticket, run the full agent pipeline, persist the result."""
     # 1. Persist ticket at "received" status first so we have a UUID for traces.
     ticket = Ticket(raw_text=payload.raw_text, channel=payload.channel, status="received")
     db.add(ticket)
     await db.commit()
     await db.refresh(ticket)
 
-    # 2. Run the full Epic F pipeline.
-    llm = get_provider(settings.llm_provider)
-    graph = build_graph(db, llm)
-    result = await graph.ainvoke({
-        "ticket_id": ticket.id,
-        "ticket_text": ticket.raw_text,
-    })
+    # Set the root Langfuse trace input explicitly
+    langfuse_client.set_current_trace_io(
+        input=payload.raw_text,
+    )
+
+    from langfuse import propagate_attributes
+    with propagate_attributes(session_id=str(ticket.id), tags=[ticket.status]):
+        # 2. Run the full Epic F pipeline.
+        llm = get_provider(settings.llm_provider)
+        graph = build_graph(db, llm)
+        result = await graph.ainvoke({
+            "ticket_id": ticket.id,
+            "ticket_text": ticket.raw_text,
+        })
 
     # 3. Update ticket record with pipeline outputs.
     ticket.intent = result.get("intent")
@@ -74,6 +73,12 @@ async def create_ticket(
             "decision": result.get("decision"),
         }
         await set_cached_answer(ticket.raw_text, cache_payload)
+
+    # Update trace output and flush
+    langfuse_client.set_current_trace_io(
+        output={"decision": ticket.decision, "final_answer": ticket.final_answer}
+    )
+    langfuse_client.flush()
 
     return ticket
 
@@ -126,46 +131,67 @@ async def get_ticket_trace(
     retriever_row = next((r for r in trace_rows if r.agent_name == "retriever"), None)
     drafter_row = next((r for r in trace_rows if r.agent_name == "drafter"), None)
     critic_row = next((r for r in trace_rows if r.agent_name == "critic"), None)
+    cache_row = next((r for r in trace_rows if r.agent_name == "cache-check"), None)
 
-    if not all([classifier_row, retriever_row, drafter_row, critic_row]):
+    is_cache_hit = cache_row is not None and cache_row.output.get("cache_hit") is True
+
+    if not is_cache_hit and not all([classifier_row, retriever_row, drafter_row, critic_row]):
         raise HTTPException(
             status_code=422,
             detail="Trace is incomplete — some agent steps have no recorded output.",
         )
 
-    from app.schemas import EntailmentStepTrace
     from app.agents.critic import STRICTER_THRESHOLD_INTENTS
 
     threshold = STRICTER_THRESHOLD_INTENTS.get(
         ticket.intent or "", settings.confidence_threshold
     )
 
+    # Fetch real entailment trace rows persisted by the E1 fix.
+    ent_result = await db.execute(
+        select(EntailmentTrace)
+        .where(EntailmentTrace.ticket_id == ticket_id)
+        .order_by(EntailmentTrace.created_at)
+    )
+    ent_rows = ent_result.scalars().all()
+
+    entailment_steps = [
+        EntailmentStepTrace(
+            chunk_id=row.chunk_id,
+            chunk_content_preview=row.chunk_content_preview,
+            supported=row.supported,
+            reason=row.reason,
+        )
+        for row in ent_rows
+    ]
+
     return TicketTrace(
         ticket_id=ticket.id,
         ticket_text=ticket.raw_text,
         # Classifier
-        intent=classifier_row.output.get("intent", ticket.intent or ""),
-        category=classifier_row.output.get("category", ticket.category or ""),
-        classifier_confidence=classifier_row.output.get("confidence", 0.0),
+        intent=classifier_row.output.get("intent", ticket.intent or "") if classifier_row else ticket.intent or "",
+        category=classifier_row.output.get("category", ticket.category or "") if classifier_row else ticket.category or "",
+        classifier_confidence=classifier_row.output.get("confidence", 0.0) if classifier_row else 0.0,
         # Retriever
-        retrieved_chunk_ids=[],     # chunk UUIDs not stored individually in AgentTrace
-        retrieved_chunk_count=retriever_row.output.get("chunk_count", 0),
+        retrieved_chunk_ids=[],
+        retrieved_chunk_count=retriever_row.output.get("chunk_count", 0) if retriever_row else 0,
         # Cache
-        cache_hit=False,            # cache hits are never persisted as trace rows
-        cached_answer=None,
+        cache_hit=is_cache_hit,
+        cached_answer=cache_row.output.get("cached_answer") if is_cache_hit else None,
         # Drafter
-        draft_answer=drafter_row.output.get("answer", ""),
-        draft_cited_chunk_ids=[uuid.UUID(cid) for cid in (ticket.cited_chunk_ids or [])],
-        draft_confidence=drafter_row.output.get("confidence", 0.0),
-        # Critic
+        draft_answer=drafter_row.output.get("answer", "") if drafter_row else (cache_row.output.get("cached_answer", "") if is_cache_hit else ""),
+        draft_cited_chunk_ids=ticket.cited_chunk_ids or [],
+        draft_confidence=drafter_row.output.get("confidence", 0.0) if drafter_row else (1.0 if is_cache_hit else 0.0),
+        # Critic — now fully populated from DB
         threshold_used=threshold,
-        entailment_steps=[],        # entailment details not stored per-step in DB yet
-        citation_supported=critic_row.output.get("citation_supported", False),
-        critic_reason=critic_row.output.get("reason", ""),
+        entailment_steps=entailment_steps,
+        citation_supported=critic_row.output.get("citation_supported", False) if critic_row else (True if is_cache_hit else False),
+        critic_reason=critic_row.output.get("reason", "") if critic_row else ("Served from semantic cache" if is_cache_hit else ""),
         # Final
         decision=ticket.decision or "escalate",
         final_answer=ticket.final_answer,
     )
+
 
 
 @router.get("/{ticket_id}", response_model=TicketResponse)

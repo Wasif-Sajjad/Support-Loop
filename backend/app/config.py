@@ -1,5 +1,4 @@
-from pydantic import ConfigDict
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -9,7 +8,7 @@ class Settings(BaseSettings):
     `settings` stays the single source of truth for all external credentials.
     """
 
-    model_config = ConfigDict(
+    model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         # Ignore unknown env vars so adding a new key to .env never crashes startup.

@@ -39,6 +39,7 @@ from app.agents.drafter import draft_resolution
 from app.agents.critic import escalation_critic, assemble_trace, STRICTER_THRESHOLD_INTENTS
 from app.cache import get_cached_answer, set_cached_answer
 from app.config import settings
+from langfuse import observe
 
 # ---------------------------------------------------------------------------
 # Semantic cache helpers (F2)
@@ -130,6 +131,7 @@ def build_graph(db: AsyncSession, llm: LLMProvider):
     # -----------------------------------------------------------------------
     # Node: classify
     # -----------------------------------------------------------------------
+    @observe(name="classify_node")
     async def classify_node(state: PipelineState) -> PipelineState:
         t0 = time.monotonic()
         result = await classify_intent(state["ticket_text"], llm)
@@ -144,10 +146,33 @@ def build_graph(db: AsyncSession, llm: LLMProvider):
     # -----------------------------------------------------------------------
     # Node: cache_check (F2)
     # -----------------------------------------------------------------------
+    @observe(name="cache_check_node")
     async def cache_check_node(state: PipelineState) -> PipelineState:
         """F2 — Check Redis for a cached answer before running retriever+drafter."""
+        from app.models import AgentTrace
+        
         cached = await _semantic_cache_lookup(state["ticket_text"])
         if cached:
+            # F3 — persist agent trace rows for cache hit
+            ticket_id = state["ticket_id"]
+            trace_rows = [
+                AgentTrace(
+                    id=uuid.uuid4(), ticket_id=ticket_id, agent_name="classifier",
+                    input={"ticket_text": state["ticket_text"]},
+                    output={"intent": state.get("intent"), "category": state.get("category"),
+                            "confidence": state.get("classifier_confidence")},
+                    latency_ms=state.get("classify_latency_ms"),
+                ),
+                AgentTrace(
+                    id=uuid.uuid4(), ticket_id=ticket_id, agent_name="cache-check",
+                    input={"ticket_text": state["ticket_text"]},
+                    output={"cache_hit": True, "cached_answer": cached.get("final_answer", "")[:500]},
+                    latency_ms=0,
+                )
+            ]
+            for row in trace_rows:
+                db.add(row)
+                
             return {
                 **state,
                 "cache_hit": True,
@@ -169,6 +194,7 @@ def build_graph(db: AsyncSession, llm: LLMProvider):
     # -----------------------------------------------------------------------
     # Node: retrieve (F1)
     # -----------------------------------------------------------------------
+    @observe(name="retrieve_node")
     async def retrieve_node(state: PipelineState) -> PipelineState:
         t0 = time.monotonic()
         chunks = await retrieve_kb(
@@ -185,6 +211,7 @@ def build_graph(db: AsyncSession, llm: LLMProvider):
     # -----------------------------------------------------------------------
     # Node: draft (F1)
     # -----------------------------------------------------------------------
+    @observe(name="draft_node")
     async def draft_node(state: PipelineState) -> PipelineState:
         t0 = time.monotonic()
         draft = await draft_resolution(
@@ -201,10 +228,11 @@ def build_graph(db: AsyncSession, llm: LLMProvider):
     # -----------------------------------------------------------------------
     # Node: critic (F1 + E1 + E4)
     # -----------------------------------------------------------------------
+    @observe(name="critic_node")
     async def critic_node(state: PipelineState) -> PipelineState:
-        """Runs E1+E2+E3 critic, assembles E4 trace, writes F3 AgentTrace rows."""
+        """E1/E2/E3/E4: critic checks ALL cited chunks, persists EntailmentTrace rows."""
         from app.schemas import ClassificationResult, DraftResolution
-        from app.models import AgentTrace
+        from app.models import AgentTrace, EntailmentTrace
 
         t0 = time.monotonic()
         classification = ClassificationResult(
@@ -218,12 +246,14 @@ def build_graph(db: AsyncSession, llm: LLMProvider):
             confidence=state["draft_confidence"],
         )
 
-        verdict = await escalation_critic(
+        result = await escalation_critic(
             classification,
             draft,
             retrieved_chunks=state.get("retrieved_chunks", []),
             llm=llm,
         )
+        verdict = result.verdict
+        entailment_results = result.entailment_results
         critic_latency = int((time.monotonic() - t0) * 1000)
 
         threshold = STRICTER_THRESHOLD_INTENTS.get(
@@ -238,13 +268,13 @@ def build_graph(db: AsyncSession, llm: LLMProvider):
             retrieved_chunks=state.get("retrieved_chunks", []),
             draft=draft,
             verdict=verdict,
-            entailment_results=state.get("entailment_results", []),
+            entailment_results=entailment_results,
             threshold_used=threshold,
             cache_hit=state.get("cache_hit", False),
             cached_answer=state.get("cached_answer"),
         )
 
-        # F3 — persist agent traces to DB
+        # F3 — persist agent trace rows
         ticket_id = state["ticket_id"]
         trace_rows = [
             AgentTrace(
@@ -264,7 +294,7 @@ def build_graph(db: AsyncSession, llm: LLMProvider):
                 id=uuid.uuid4(), ticket_id=ticket_id, agent_name="drafter",
                 input={"ticket_text": state["ticket_text"],
                        "chunk_count": len(state.get("retrieved_chunks", []))},
-                output={"answer": state["answer"][:500],  # truncate for DB storage
+                output={"answer": state["answer"][:500],
                         "confidence": state["draft_confidence"],
                         "cited_count": len(state["cited_chunk_ids"])},
                 latency_ms=state.get("draft_latency_ms"),
@@ -273,13 +303,24 @@ def build_graph(db: AsyncSession, llm: LLMProvider):
                 id=uuid.uuid4(), ticket_id=ticket_id, agent_name="critic",
                 input={"intent": state["intent"], "draft_confidence": state["draft_confidence"]},
                 output={"decision": verdict.decision, "reason": verdict.reason,
-                        "citation_supported": verdict.citation_supported},
+                        "citation_supported": verdict.citation_supported,
+                        "chunks_checked": len(entailment_results)},
                 latency_ms=critic_latency,
             ),
         ]
         for row in trace_rows:
             db.add(row)
-        # Commit happens in the router after ticket record is also updated.
+
+        # E1 fix — persist one EntailmentTrace row per checked chunk.
+        for chunk, ent_result in entailment_results:
+            db.add(EntailmentTrace(
+                id=uuid.uuid4(),
+                ticket_id=ticket_id,
+                chunk_id=chunk.chunk_id,
+                chunk_content_preview=chunk.content[:200],
+                supported=ent_result.supported,
+                reason=ent_result.reason,
+            ))
 
         return {
             **state,
@@ -288,6 +329,7 @@ def build_graph(db: AsyncSession, llm: LLMProvider):
             "citation_supported": verdict.citation_supported,
             "threshold_used": threshold,
             "critic_latency_ms": critic_latency,
+            "entailment_results": entailment_results,
             "trace": trace,
         }
 

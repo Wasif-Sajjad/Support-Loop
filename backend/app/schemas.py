@@ -35,6 +35,22 @@ class CriticVerdict(BaseModel):
     citation_supported: bool
 
 
+class CriticVerdictWithTrace(BaseModel):
+    """Extended return from escalation_critic that includes per-chunk entailment results.
+
+    Separating this from CriticVerdict keeps the DB schema clean while still giving
+    graph.py everything it needs to persist EntailmentTrace rows and assemble the
+    full TicketTrace.entailment_steps list.
+    """
+
+    verdict: CriticVerdict
+    # One (chunk, result) pair per cited chunk that was entailment-checked.
+    # Empty if the critic short-circuited before reaching the entailment step
+    # (e.g. denylist or confidence-floor escalation).
+    entailment_results: list[tuple["RetrievedChunk", "EntailmentResult"]] = []
+
+
+
 class EntailmentResult(BaseModel):
     """Structured output from the E1 citation entailment check.
 

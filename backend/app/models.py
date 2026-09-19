@@ -53,6 +53,23 @@ class AgentTrace(Base):
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=datetime.utcnow)
 
 
+class EntailmentTrace(Base):
+    """Persists one E1 entailment check result per cited chunk per ticket.
+
+    One row per (ticket_id, chunk_id) pair checked during the critic step.
+    GET /tickets/{id}/trace reads these rows to populate TicketTrace.entailment_steps.
+    """
+    __tablename__ = "entailment_traces"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    ticket_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tickets.id"), nullable=False)
+    chunk_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    chunk_content_preview: Mapped[str] = mapped_column(Text, nullable=False)  # first 200 chars
+    supported: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+
 class EvalCase(Base):
     __tablename__ = "eval_set"
 

@@ -5,8 +5,13 @@ from pydantic import BaseModel
 from app.config import settings
 from app.llm.base import LLMProvider, LLMResponse
 
-# Free tier: console.groq.com — no card required, ~30 req/min on Llama 3.3 70B (verify current limits).
-DEFAULT_MODEL = "llama-3.3-70b-versatile"
+# Available free-tier models on Groq (as of 2026-09):
+#   openai/gpt-oss-120b   ← best quality, free
+#   openai/gpt-oss-20b    ← faster, lighter
+#   qwen/qwen3.8-27b      ← alternative
+#   groq/compound         ← compound model
+# Update DEFAULT_MODEL here if Groq retires a model.
+DEFAULT_MODEL = "openai/gpt-oss-120b"
 
 
 class GroqProvider(LLMProvider):
