@@ -1,0 +1,13 @@
+﻿ticket_text,correct_intent,correct_category
+"forgot my login pin, how do I reset it",recover_password,ACCOUNT
+"i want to open a new account for my startup",create_account,ACCOUNT
+"please close my current account permanently",delete_account,ACCOUNT
+"i need to update my phone number on file",edit_account,ACCOUNT
+"how do i move to a business plan from personal",switch_account,ACCOUNT
+"sign-up page keeps throwing an error when i submit",registration_problems,ACCOUNT
+"i want to speak with a real person not a bot",contact_human_agent,CONTACT
+"what are your support hours and how can i reach you",contact_customer_service,CONTACT
+"i am very unhappy with how my issue was handled",complaint,FEEDBACK
+"my nginx reverse proxy returns 502 after deploying new config",infrastructure_issue,INFRA
+"how do i horizontally scale a deployment in kubernetes",infrastructure_issue,INFRA
+"s3 bucket policy change locked me out of my own bucket",infrastructure_issue,INFRA

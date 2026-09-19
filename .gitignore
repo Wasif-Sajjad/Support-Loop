@@ -8,8 +8,8 @@ node_modules/
 dist/
 *.egg-info/
 .pytest_cache/
-data/kb/*
-!data/kb/.gitkeep
+data/kb/**
+!data/kb/**/.gitkeep
 .DS_Store
 
 # HuggingFace Datasets Cache

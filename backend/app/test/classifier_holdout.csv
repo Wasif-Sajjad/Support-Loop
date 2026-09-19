@@ -1,0 +1,13 @@
+ticket_text,correct_intent,correct_category
+"help to file a complaint against ur company",complaint,FEEDBACK
+"tell me what hours I can get in touch with customer support",contact_customer_service,CONTACT
+"need assistance contacting an operator",contact_human_agent,CONTACT
+"want assistance opening a standard account",create_account,ACCOUNT
+"I don't know what to do to close a pro accoount",delete_account,ACCOUNT
+"correct details on pro account",edit_account,ACCOUNT
+"I want to retrieve the password of my user account",recover_password,ACCOUNT
+"notifying of issues with sign-up",registration_problems,ACCOUNT
+"i have to use the business account",switch_account,ACCOUNT
+"getting a 502 bad gateway on prod nginx",infrastructure_issue,INFRA
+"database connection keeps timing out after the deploy",infrastructure_issue,INFRA
+"my deployment rollout is stuck at 0 of 3 replicas",infrastructure_issue,INFRA
