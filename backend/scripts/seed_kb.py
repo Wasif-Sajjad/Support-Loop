@@ -49,7 +49,16 @@ SCOPED_KB_DIRS = [
     "data/kb/contact",
     "data/kb/feedback",
     "data/kb/infrastructure",
+    # Cloned real-world infrastructure docs (present in repo, gitignored by content but kept by .gitkeep)
+    "data/kb/k8s-docs",
+    "data/kb/docker-docs",
+    "data/kb/aws-ecs-docs",
 ]
+
+# Safety cap: embedding thousands of docs locally is slow. Cap at 200 for now.
+# Remove this cap once running in Docker with a GPU or when seeding against the
+# production DB (where you only need to run once).
+MAX_FILES = 200
 
 
 def chunk_text(content: str) -> list[str]:
@@ -93,6 +102,11 @@ async def main() -> None:
             + "\nSee scripts/seed_kb.py module docstring for sourcing guidance."
         )
         return
+
+    # Apply safety cap to avoid multi-hour embedding runs locally.
+    if len(all_files) > MAX_FILES:
+        print(f"⚠ Found {len(all_files)} files — capping at {MAX_FILES} for local seeding.")
+        all_files = all_files[:MAX_FILES]
 
     print(f"Found {len(all_files)} file(s) to ingest.")
 
