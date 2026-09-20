@@ -1,3 +1,54 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  background-color: #12151A;
+  color: #E7E9ED;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Hairline border utilities */
+.border-hairline {
+  border-width: 1px;
+  border-color: #262B33;
+}
+
+/* Accessible, crisp focus ring */
+:focus-visible {
+  outline: 1px solid #4FB286;
+  outline-offset: 2px;
+}
+
+/* Subtle scrollbars for ops dashboard */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #12151A;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #262B33;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #363C47;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
