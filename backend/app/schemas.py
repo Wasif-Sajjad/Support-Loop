@@ -15,6 +15,11 @@ class ClassificationResult(BaseModel):
     intent: str
     category: str
     confidence: float = Field(..., ge=0, le=1)
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cost_usd: float = 0.0
+    latency_ms: int = 0
+    provider_name: str = "unknown"
 
 
 class RetrievedChunk(BaseModel):
@@ -27,6 +32,11 @@ class DraftResolution(BaseModel):
     answer: str
     cited_chunk_ids: list[uuid.UUID] = Field(default_factory=list)
     confidence: float = Field(..., ge=0, le=1)
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cost_usd: float = 0.0
+    latency_ms: int = 0
+    provider_name: str = "unknown"
 
 
 class CriticVerdict(BaseModel):
@@ -50,7 +60,6 @@ class CriticVerdictWithTrace(BaseModel):
     entailment_results: list[tuple["RetrievedChunk", "EntailmentResult"]] = []
 
 
-
 class EntailmentResult(BaseModel):
     """Structured output from the E1 citation entailment check.
 
@@ -61,6 +70,11 @@ class EntailmentResult(BaseModel):
 
     supported: bool
     reason: str  # ≤ 2 sentences, used in the E4 reasoning trace
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cost_usd: float = 0.0
+    latency_ms: int = 0
+    provider_name: str = "unknown"
 
 
 class TicketResponse(BaseModel):

@@ -117,6 +117,91 @@ export default function DashboardPage() {
             </div>
           </div>
 
+          {/* Epic G2: Provider Cost & Reliability Tradeoff Card */}
+          <div className="rounded border border-border bg-surface p-5 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/60 pb-3">
+              <div>
+                <h2 className="text-sm font-semibold tracking-tight text-text-primary">
+                  LLM Provider Cost & Reliability Breakdown
+                </h2>
+                <p className="text-[11px] text-text-secondary mt-0.5">
+                  Comparative telemetry between Primary (Groq) and Automated Failover (Gemini).
+                </p>
+              </div>
+              <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-surface-raised border border-border text-text-secondary">
+                estimated at standard pricing ($0 free-tier actual)
+              </span>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {/* Groq Card */}
+              <div className="rounded border border-border/80 bg-surface-raised/40 p-4 space-y-2">
+                <div className="flex items-center justify-between">
+                  <div className="font-medium text-xs text-text-primary flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-resolve" />
+                    Groq (Llama 3.3 70B) — Primary
+                  </div>
+                  <span className="font-mono text-[11px] text-text-secondary">
+                    {metrics.provider_breakdown?.groq?.calls ?? 0} calls
+                  </span>
+                </div>
+                <div className="grid grid-cols-3 gap-2 pt-2 border-t border-border/40 text-[11px] font-mono">
+                  <div>
+                    <span className="text-text-secondary block text-[10px]">Est. Cost</span>
+                    <span className="text-text-primary font-semibold">
+                      {formatCost(metrics.provider_breakdown?.groq?.cost_usd ?? 0)}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-text-secondary block text-[10px]">Avg Latency</span>
+                    <span className="text-text-primary">
+                      {formatLatency(metrics.provider_breakdown?.groq?.avg_latency_ms ?? 0)}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-text-secondary block text-[10px]">Tokens (In/Out)</span>
+                    <span className="text-text-secondary">
+                      {metrics.provider_breakdown?.groq?.tokens_in ?? 0} / {metrics.provider_breakdown?.groq?.tokens_out ?? 0}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Gemini Card */}
+              <div className="rounded border border-border/80 bg-surface-raised/40 p-4 space-y-2">
+                <div className="flex items-center justify-between">
+                  <div className="font-medium text-xs text-text-primary flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-escalate" />
+                    Gemini 1.5 Flash — Failover Fallback
+                  </div>
+                  <span className="font-mono text-[11px] text-text-secondary">
+                    {metrics.provider_breakdown?.gemini?.calls ?? 0} calls
+                  </span>
+                </div>
+                <div className="grid grid-cols-3 gap-2 pt-2 border-t border-border/40 text-[11px] font-mono">
+                  <div>
+                    <span className="text-text-secondary block text-[10px]">Est. Cost</span>
+                    <span className="text-text-primary font-semibold">
+                      {formatCost(metrics.provider_breakdown?.gemini?.cost_usd ?? 0)}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-text-secondary block text-[10px]">Avg Latency</span>
+                    <span className="text-text-primary">
+                      {formatLatency(metrics.provider_breakdown?.gemini?.avg_latency_ms ?? 0)}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-text-secondary block text-[10px]">Tokens (In/Out)</span>
+                    <span className="text-text-secondary">
+                      {metrics.provider_breakdown?.gemini?.tokens_in ?? 0} / {metrics.provider_breakdown?.gemini?.tokens_out ?? 0}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
           {/* Recent Ingress Traffic */}
           <div className="space-y-3">
             <div className="flex items-center justify-between">

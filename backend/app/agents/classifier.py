@@ -66,4 +66,10 @@ async def classify_intent(ticket_text: str, llm: LLMProvider) -> ClassificationR
     ]
     response = await llm.complete(messages, response_schema=ClassificationResult)
     data = json.loads(response.text)
-    return ClassificationResult(**data)
+    result = ClassificationResult(**data)
+    result.tokens_in = response.tokens_in
+    result.tokens_out = response.tokens_out
+    result.cost_usd = response.cost_usd
+    result.latency_ms = response.latency_ms
+    result.provider_name = response.provider_name
+    return result

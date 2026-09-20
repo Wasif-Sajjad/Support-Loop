@@ -2,13 +2,25 @@
 
 Requires INTEGRATION=1 and the Docker stack to be up (docker compose up).
 """
+import asyncio
 import os
+import uuid
 import httpx
 import pytest
 
 API_URL = os.getenv("API_URL", "http://localhost:8000")
 
-import uuid
+
+async def _poll_ticket(client: httpx.AsyncClient, ticket_id: str, max_seconds: int = 40) -> dict:
+    for _ in range(max_seconds * 2):
+        resp = await client.get(f"/tickets/{ticket_id}")
+        assert resp.status_code == 200
+        ticket = resp.json()
+        if ticket["status"] in ("resolved", "escalated", "failed"):
+            return ticket
+        await asyncio.sleep(0.5)
+    pytest.fail(f"Ticket {ticket_id} did not complete within {max_seconds}s")
+
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(
@@ -16,14 +28,18 @@ import uuid
     reason="Integration test — set INTEGRATION=1 to run against live Docker stack",
 )
 async def test_e2e_recover_password():
-    """Submit a recover_password ticket. It is KB-backed, so it should auto-resolve."""
+    """Submit a recover_password ticket. It is KB-backed, so it should auto-resolve via worker."""
     async with httpx.AsyncClient(base_url=API_URL) as client:
         # POST /tickets - use unique string to bypass semantic cache
         unique_id = uuid.uuid4().hex[:8]
         payload = {"raw_text": f"I forgot my password and need to reset it. How do I do that? [{unique_id}]"}
         response = await client.post("/tickets", json=payload, timeout=60.0)
         assert response.status_code == 200, response.text
-        ticket = response.json()
+        initial_ticket = response.json()
+        assert initial_ticket["status"] == "received"
+
+        # Poll until worker completes processing
+        ticket = await _poll_ticket(client, initial_ticket["id"])
         
         assert ticket["intent"] == "recover_password"
         assert ticket["decision"] == "auto_resolve"
@@ -56,7 +72,11 @@ async def test_e2e_delete_account():
         payload = {"raw_text": "Please delete my account immediately, I am done using this service."}
         response = await client.post("/tickets", json=payload, timeout=60.0)
         assert response.status_code == 200, response.text
-        ticket = response.json()
+        initial_ticket = response.json()
+        assert initial_ticket["status"] == "received"
+
+        # Poll until worker completes processing
+        ticket = await _poll_ticket(client, initial_ticket["id"])
         
         assert ticket["intent"] == "delete_account"
         assert ticket["decision"] == "escalate"
@@ -71,3 +91,4 @@ async def test_e2e_delete_account():
         assert trace["intent"] == "delete_account"
         assert trace["decision"] == "escalate"
         assert "denylist" in trace["critic_reason"].lower()
+

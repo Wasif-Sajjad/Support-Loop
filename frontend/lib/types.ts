@@ -84,12 +84,23 @@ export interface TicketTrace {
   final_answer: string | null;
 }
 
+export interface ProviderCostMetrics {
+  calls: number;
+  tokens_in: number;
+  tokens_out: number;
+  cost_usd: number;
+  avg_latency_ms: number;
+  pricing_label: string;
+}
+
 export interface MetricsSummary {
   total_tickets: number;
   resolution_rate: number;
   escalation_rate: number;
   avg_cost_usd: number | null;
   avg_latency_ms: number | null;
+  pricing_disclaimer?: string;
+  provider_breakdown?: Record<string, ProviderCostMetrics>;
 }
 
 /** Narrow, typed error shape for failed API calls. */

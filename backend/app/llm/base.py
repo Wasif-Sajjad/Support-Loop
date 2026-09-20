@@ -12,6 +12,7 @@ class LLMResponse(BaseModel):
     tokens_out: int = 0
     cost_usd: float = 0.0
     latency_ms: int = 0
+    provider_name: str = "unknown"
 
 
 class LLMProvider(ABC):
@@ -52,6 +53,7 @@ class RetryFallbackProvider(LLMProvider):
 
     @observe(as_type="generation")
     async def _run_provider(self, provider: LLMProvider, messages: list[dict], response_schema: type[BaseModel] | None) -> LLMResponse:
+        provider_name = provider.__class__.__name__.replace("Provider", "").lower()
         # Best practice: Explicitly set input and model name so we don't leak `self` or other kwargs.
         langfuse_client.update_current_generation(
             name=provider.__class__.__name__,
@@ -59,9 +61,15 @@ class RetryFallbackProvider(LLMProvider):
             input=messages,
         )
         response = await provider.complete(messages, response_schema)
+        response.provider_name = provider_name
         langfuse_client.update_current_generation(
             output=response.text,
-            usage_details={"input": response.tokens_in, "output": response.tokens_out}
+            usage_details={"input": response.tokens_in, "output": response.tokens_out},
+            metadata={
+                "cost_usd_est": response.cost_usd,
+                "pricing_label": "estimated at standard pricing",
+                "provider": provider_name,
+            }
         )
         return response
 

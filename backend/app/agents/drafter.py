@@ -112,5 +112,11 @@ async def draft_resolution(
         # If IDs are malformed, treat as no citation → will trigger escalation in critic.
         data["cited_chunk_ids"] = []
 
-    return DraftResolution(**data)
+    draft = DraftResolution(**data)
+    draft.tokens_in = response.tokens_in
+    draft.tokens_out = response.tokens_out
+    draft.cost_usd = response.cost_usd
+    draft.latency_ms = response.latency_ms
+    draft.provider_name = response.provider_name
+    return draft
 

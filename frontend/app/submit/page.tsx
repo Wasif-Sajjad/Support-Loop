@@ -1,8 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
 import Link from "next/link";
-import { createTicket } from "@/lib/api";
+import { createTicket, getTicket } from "@/lib/api";
 import { formatIntent, formatCategory, isPolicyDenylist } from "@/lib/labels";
 import type { TicketResponse } from "@/lib/types";
 import { ApiError } from "@/lib/types";
@@ -36,25 +36,78 @@ export default function SubmitPage() {
   const [ticket, setTicket] = useState<TicketResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [pollStage, setPollStage] = useState<string>("Enqueued");
+  const pollTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+    };
+  }, []);
+
+  async function pollTicketStatus(ticketId: string, attempts = 0) {
+    if (attempts > 60) {
+      setError("Ticket execution timed out. Please check the queue or try again.");
+      setLoading(false);
+      return;
+    }
+
+    try {
+      const current = await getTicket(ticketId);
+      if (current.status === "resolved" || current.status === "escalated") {
+        setTicket(current);
+        setLoading(false);
+        return;
+      }
+      if (current.status === "failed") {
+        setError("Autonomous triage pipeline failed during execution.");
+        setLoading(false);
+        return;
+      }
+
+      // Update in-progress animation stage
+      if (attempts === 0) setPollStage("Enqueued to ARQ Task Queue");
+      else if (attempts === 1) setPollStage("Running Intent Classification & Retrieval");
+      else if (attempts >= 2) setPollStage("Executing Drafting & Entailment Critic");
+
+      pollTimerRef.current = setTimeout(() => {
+        pollTicketStatus(ticketId, attempts + 1);
+      }, 1200);
+    } catch (err) {
+      setError(
+        err instanceof ApiError ? err.message : "Failed to poll ticket status."
+      );
+      setLoading(false);
+    }
+  }
 
   async function handleSubmit(e?: React.FormEvent) {
     if (e) e.preventDefault();
     if (!text.trim() || loading) return;
 
+    if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
     setLoading(true);
     setError(null);
     setTicket(null);
+    setPollStage("Enqueued to ARQ Task Queue");
 
     try {
-      const result = await createTicket({ raw_text: text });
-      setTicket(result);
+      const initialTicket = await createTicket({ raw_text: text });
+      if (initialTicket.status === "resolved" || initialTicket.status === "escalated") {
+        setTicket(initialTicket);
+        setLoading(false);
+      } else {
+        // Asynchronous processing: start polling loop
+        pollTimerRef.current = setTimeout(() => {
+          pollTicketStatus(initialTicket.id, 0);
+        }, 800);
+      }
     } catch (err) {
       setError(
         err instanceof ApiError
           ? err.message
-          : "Failed to execute triage pipeline."
+          : "Failed to submit ticket."
       );
-    } finally {
       setLoading(false);
     }
   }
@@ -142,10 +195,10 @@ export default function SubmitPage() {
         <div className="rounded border border-border bg-surface p-5 text-xs text-text-secondary space-y-2">
           <div className="flex items-center gap-2 font-mono">
             <span className="w-2 h-2 rounded-full bg-resolve animate-ping" />
-            <span>Running: Classification &rarr; Retrieval &rarr; Drafting &rarr; Entailment Critic</span>
+            <span className="text-text-primary font-medium">{pollStage}…</span>
           </div>
           <p className="text-[11px] text-text-secondary/70">
-            Evaluating citations against knowledge base chunks and enforcing confidence floors.
+            Async worker pipeline: Classification &rarr; Knowledge Retrieval &rarr; Resolution Drafting &rarr; Entailment Critic.
           </p>
         </div>
       )}

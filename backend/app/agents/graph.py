@@ -87,6 +87,10 @@ class PipelineState(TypedDict, total=False):
     category: str
     classifier_confidence: float
     classify_latency_ms: int
+    classify_tokens_in: int
+    classify_tokens_out: int
+    classify_cost_usd: float
+    classify_provider: str
 
     # Retriever output
     retrieved_chunks: list           # list[RetrievedChunk]
@@ -97,6 +101,10 @@ class PipelineState(TypedDict, total=False):
     cited_chunk_ids: list            # list[uuid.UUID]
     draft_confidence: float
     draft_latency_ms: int
+    draft_tokens_in: int
+    draft_tokens_out: int
+    draft_cost_usd: float
+    draft_provider: str
 
     # Critic output
     decision: str                    # "auto_resolve" | "escalate"
@@ -105,6 +113,10 @@ class PipelineState(TypedDict, total=False):
     threshold_used: float
     entailment_results: list         # list[tuple[RetrievedChunk, EntailmentResult]]
     critic_latency_ms: int
+    critic_tokens_in: int
+    critic_tokens_out: int
+    critic_cost_usd: float
+    critic_provider: str
 
     # F3 — assembled trace (set after critic node)
     trace: Any                       # TicketTrace
@@ -141,6 +153,10 @@ def build_graph(db: AsyncSession, llm: LLMProvider):
             "category": result.category,
             "classifier_confidence": result.confidence,
             "classify_latency_ms": int((time.monotonic() - t0) * 1000),
+            "classify_tokens_in": result.tokens_in,
+            "classify_tokens_out": result.tokens_out,
+            "classify_cost_usd": result.cost_usd,
+            "classify_provider": result.provider_name,
         }
 
     # -----------------------------------------------------------------------
@@ -154,24 +170,32 @@ def build_graph(db: AsyncSession, llm: LLMProvider):
         cached = await _semantic_cache_lookup(state["ticket_text"])
         if cached:
             # F3 — persist agent trace rows for cache hit
-            ticket_id = state["ticket_id"]
-            trace_rows = [
-                AgentTrace(
-                    id=uuid.uuid4(), ticket_id=ticket_id, agent_name="classifier",
-                    input={"ticket_text": state["ticket_text"]},
-                    output={"intent": state.get("intent"), "category": state.get("category"),
-                            "confidence": state.get("classifier_confidence")},
-                    latency_ms=state.get("classify_latency_ms"),
-                ),
-                AgentTrace(
-                    id=uuid.uuid4(), ticket_id=ticket_id, agent_name="cache-check",
-                    input={"ticket_text": state["ticket_text"]},
-                    output={"cache_hit": True, "cached_answer": cached.get("final_answer", "")[:500]},
-                    latency_ms=0,
-                )
-            ]
-            for row in trace_rows:
-                db.add(row)
+            ticket_id = state.get("ticket_id")
+            if ticket_id:
+                trace_rows = [
+                    AgentTrace(
+                        id=uuid.uuid4(), ticket_id=ticket_id, agent_name="classifier",
+                        input={"ticket_text": state["ticket_text"]},
+                        output={"intent": state.get("intent"), "category": state.get("category"),
+                                "confidence": state.get("classifier_confidence"),
+                                "provider": state.get("classify_provider")},
+                        tokens_in=state.get("classify_tokens_in", 0),
+                        tokens_out=state.get("classify_tokens_out", 0),
+                        cost_usd=state.get("classify_cost_usd", 0.0),
+                        latency_ms=state.get("classify_latency_ms"),
+                    ),
+                    AgentTrace(
+                        id=uuid.uuid4(), ticket_id=ticket_id, agent_name="cache-check",
+                        input={"ticket_text": state["ticket_text"]},
+                        output={"cache_hit": True, "cached_answer": cached.get("final_answer", "")[:500]},
+                        tokens_in=0,
+                        tokens_out=0,
+                        cost_usd=0.0,
+                        latency_ms=0,
+                    )
+                ]
+                for row in trace_rows:
+                    db.add(row)
                 
             return {
                 **state,
@@ -223,6 +247,10 @@ def build_graph(db: AsyncSession, llm: LLMProvider):
             "cited_chunk_ids": draft.cited_chunk_ids,
             "draft_confidence": draft.confidence,
             "draft_latency_ms": int((time.monotonic() - t0) * 1000),
+            "draft_tokens_in": draft.tokens_in,
+            "draft_tokens_out": draft.tokens_out,
+            "draft_cost_usd": draft.cost_usd,
+            "draft_provider": draft.provider_name,
         }
 
     # -----------------------------------------------------------------------
@@ -256,13 +284,21 @@ def build_graph(db: AsyncSession, llm: LLMProvider):
         entailment_results = result.entailment_results
         critic_latency = int((time.monotonic() - t0) * 1000)
 
+        # Compute aggregate critic tokens & cost from entailment checks
+        critic_tokens_in = sum(r.tokens_in for _, r in entailment_results)
+        critic_tokens_out = sum(r.tokens_out for _, r in entailment_results)
+        critic_cost_usd = round(sum(r.cost_usd for _, r in entailment_results), 8)
+        critic_provider = entailment_results[0][1].provider_name if entailment_results else "unknown"
+
         threshold = STRICTER_THRESHOLD_INTENTS.get(
             state.get("intent", ""), settings.confidence_threshold
         )
 
+        ticket_id = state.get("ticket_id")
+
         # E4 — assemble the full reasoning trace
         trace = assemble_trace(
-            ticket_id=state["ticket_id"],
+            ticket_id=ticket_id or uuid.uuid4(),
             ticket_text=state["ticket_text"],
             classification=classification,
             retrieved_chunks=state.get("retrieved_chunks", []),
@@ -274,53 +310,68 @@ def build_graph(db: AsyncSession, llm: LLMProvider):
             cached_answer=state.get("cached_answer"),
         )
 
-        # F3 — persist agent trace rows
-        ticket_id = state["ticket_id"]
-        trace_rows = [
-            AgentTrace(
-                id=uuid.uuid4(), ticket_id=ticket_id, agent_name="classifier",
-                input={"ticket_text": state["ticket_text"]},
-                output={"intent": state["intent"], "category": state["category"],
-                        "confidence": state["classifier_confidence"]},
-                latency_ms=state.get("classify_latency_ms"),
-            ),
-            AgentTrace(
-                id=uuid.uuid4(), ticket_id=ticket_id, agent_name="retriever",
-                input={"ticket_text": state["ticket_text"], "category_hint": state.get("category")},
-                output={"chunk_count": len(state.get("retrieved_chunks", []))},
-                latency_ms=state.get("retrieve_latency_ms"),
-            ),
-            AgentTrace(
-                id=uuid.uuid4(), ticket_id=ticket_id, agent_name="drafter",
-                input={"ticket_text": state["ticket_text"],
-                       "chunk_count": len(state.get("retrieved_chunks", []))},
-                output={"answer": state["answer"][:500],
-                        "confidence": state["draft_confidence"],
-                        "cited_count": len(state["cited_chunk_ids"])},
-                latency_ms=state.get("draft_latency_ms"),
-            ),
-            AgentTrace(
-                id=uuid.uuid4(), ticket_id=ticket_id, agent_name="critic",
-                input={"intent": state["intent"], "draft_confidence": state["draft_confidence"]},
-                output={"decision": verdict.decision, "reason": verdict.reason,
-                        "citation_supported": verdict.citation_supported,
-                        "chunks_checked": len(entailment_results)},
-                latency_ms=critic_latency,
-            ),
-        ]
-        for row in trace_rows:
-            db.add(row)
+        # F3 — persist agent trace rows if ticket_id is present
+        if ticket_id:
+            trace_rows = [
+                AgentTrace(
+                    id=uuid.uuid4(), ticket_id=ticket_id, agent_name="classifier",
+                    input={"ticket_text": state["ticket_text"]},
+                    output={"intent": state["intent"], "category": state["category"],
+                            "confidence": state["classifier_confidence"],
+                            "provider": state.get("classify_provider", "unknown")},
+                    tokens_in=state.get("classify_tokens_in", 0),
+                    tokens_out=state.get("classify_tokens_out", 0),
+                    cost_usd=state.get("classify_cost_usd", 0.0),
+                    latency_ms=state.get("classify_latency_ms"),
+                ),
+                AgentTrace(
+                    id=uuid.uuid4(), ticket_id=ticket_id, agent_name="retriever",
+                    input={"ticket_text": state["ticket_text"], "category_hint": state.get("category")},
+                    output={"chunk_count": len(state.get("retrieved_chunks", []))},
+                    tokens_in=0,
+                    tokens_out=0,
+                    cost_usd=0.0,
+                    latency_ms=state.get("retrieve_latency_ms"),
+                ),
+                AgentTrace(
+                    id=uuid.uuid4(), ticket_id=ticket_id, agent_name="drafter",
+                    input={"ticket_text": state["ticket_text"],
+                           "chunk_count": len(state.get("retrieved_chunks", []))},
+                    output={"answer": state["answer"][:500],
+                            "confidence": state["draft_confidence"],
+                            "cited_count": len(state["cited_chunk_ids"]),
+                            "provider": state.get("draft_provider", "unknown")},
+                    tokens_in=state.get("draft_tokens_in", 0),
+                    tokens_out=state.get("draft_tokens_out", 0),
+                    cost_usd=state.get("draft_cost_usd", 0.0),
+                    latency_ms=state.get("draft_latency_ms"),
+                ),
+                AgentTrace(
+                    id=uuid.uuid4(), ticket_id=ticket_id, agent_name="critic",
+                    input={"intent": state["intent"], "draft_confidence": state["draft_confidence"]},
+                    output={"decision": verdict.decision, "reason": verdict.reason,
+                            "citation_supported": verdict.citation_supported,
+                            "chunks_checked": len(entailment_results),
+                            "provider": critic_provider},
+                    tokens_in=critic_tokens_in,
+                    tokens_out=critic_tokens_out,
+                    cost_usd=critic_cost_usd,
+                    latency_ms=critic_latency,
+                ),
+            ]
+            for row in trace_rows:
+                db.add(row)
 
-        # E1 fix — persist one EntailmentTrace row per checked chunk.
-        for chunk, ent_result in entailment_results:
-            db.add(EntailmentTrace(
-                id=uuid.uuid4(),
-                ticket_id=ticket_id,
-                chunk_id=chunk.chunk_id,
-                chunk_content_preview=chunk.content[:200],
-                supported=ent_result.supported,
-                reason=ent_result.reason,
-            ))
+            # E1 fix — persist one EntailmentTrace row per checked chunk.
+            for chunk, ent_result in entailment_results:
+                db.add(EntailmentTrace(
+                    id=uuid.uuid4(),
+                    ticket_id=ticket_id,
+                    chunk_id=chunk.chunk_id,
+                    chunk_content_preview=chunk.content[:200],
+                    supported=ent_result.supported,
+                    reason=ent_result.reason,
+                ))
 
         return {
             **state,
@@ -329,6 +380,10 @@ def build_graph(db: AsyncSession, llm: LLMProvider):
             "citation_supported": verdict.citation_supported,
             "threshold_used": threshold,
             "critic_latency_ms": critic_latency,
+            "critic_tokens_in": critic_tokens_in,
+            "critic_tokens_out": critic_tokens_out,
+            "critic_cost_usd": critic_cost_usd,
+            "critic_provider": critic_provider,
             "entailment_results": entailment_results,
             "trace": trace,
         }

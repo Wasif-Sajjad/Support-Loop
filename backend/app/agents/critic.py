@@ -125,7 +125,13 @@ async def entailment_check(
         raw = raw.strip()
 
     data = json.loads(raw)
-    return EntailmentResult(**data)
+    result = EntailmentResult(**data)
+    result.tokens_in = response.tokens_in
+    result.tokens_out = response.tokens_out
+    result.cost_usd = response.cost_usd
+    result.latency_ms = response.latency_ms
+    result.provider_name = response.provider_name
+    return result
 
 
 # ---------------------------------------------------------------------------

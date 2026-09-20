@@ -22,63 +22,38 @@ from app.cache import set_cached_answer
 router = APIRouter(prefix="/tickets", tags=["tickets"])
 
 
+import logging
+from app.worker import get_arq_pool
+
+logger = logging.getLogger(__name__)
+
 from langfuse import observe, get_client
 langfuse_client = get_client()
 
 @router.post("", response_model=TicketResponse)
-@observe(name="ticket_resolution")
+@observe(name="ticket_resolution_submit")
 async def create_ticket(
     payload: TicketCreate,
     db: AsyncSession = Depends(get_db),
 ) -> TicketResponse:
-    """Submit a raw ticket, run the full agent pipeline, persist the result."""
-    # 1. Persist ticket at "received" status first so we have a UUID for traces.
+    """Submit a raw ticket, create ticket row with status 'received', and enqueue ARQ worker job."""
+    # 1. Persist ticket at "received" status immediately.
     ticket = Ticket(raw_text=payload.raw_text, channel=payload.channel, status="received")
     db.add(ticket)
     await db.commit()
     await db.refresh(ticket)
 
-    # Set the root Langfuse trace input explicitly
+    # Set root trace input
     langfuse_client.set_current_trace_io(
         input=payload.raw_text,
     )
 
-    from langfuse import propagate_attributes
-    with propagate_attributes(session_id=str(ticket.id), tags=[ticket.status]):
-        # 2. Run the full Epic F pipeline.
-        llm = get_provider(settings.llm_provider)
-        graph = build_graph(db, llm)
-        result = await graph.ainvoke({
-            "ticket_id": ticket.id,
-            "ticket_text": ticket.raw_text,
-        })
-
-    # 3. Update ticket record with pipeline outputs.
-    ticket.intent = result.get("intent")
-    ticket.category = result.get("category")
-    ticket.classifier_confidence = result.get("classifier_confidence")
-    ticket.final_answer = result.get("answer") if result.get("decision") == "auto_resolve" else None
-    ticket.cited_chunk_ids = [str(cid) for cid in result.get("cited_chunk_ids", [])]
-    ticket.decision = result.get("decision")
-    ticket.status = "resolved" if result.get("decision") == "auto_resolve" else "escalated"
-
-    await db.commit()
-    await db.refresh(ticket)
-
-    # 4. F2 — write successful auto-resolve answers to the semantic cache.
-    if result.get("decision") == "auto_resolve" and result.get("answer"):
-        trace = result.get("trace")
-        cache_payload = trace.model_dump(mode="json") if trace else {
-            "final_answer": result.get("answer"),
-            "decision": result.get("decision"),
-        }
-        await set_cached_answer(ticket.raw_text, cache_payload)
-
-    # Update trace output and flush
-    langfuse_client.set_current_trace_io(
-        output={"decision": ticket.decision, "final_answer": ticket.final_answer}
-    )
-    langfuse_client.flush()
+    # 2. Enqueue background task in ARQ queue
+    try:
+        pool = await get_arq_pool()
+        await pool.enqueue_job("process_ticket_job", str(ticket.id))
+    except Exception as exc:
+        logger.error(f"Failed to enqueue ticket {ticket.id} to ARQ worker: {exc}")
 
     return ticket
 

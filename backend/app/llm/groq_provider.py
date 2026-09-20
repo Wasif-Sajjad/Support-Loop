@@ -4,6 +4,7 @@ from pydantic import BaseModel
 
 from app.config import settings
 from app.llm.base import LLMProvider, LLMResponse
+from app.llm.pricing import calculate_cost
 
 # Available free-tier models on Groq (as of 2026-09):
 #   openai/gpt-oss-120b   ← best quality, free
@@ -30,10 +31,13 @@ class GroqProvider(LLMProvider):
         )
         latency_ms = int((time.monotonic() - start) * 1000)
         usage = resp.usage
+        tokens_in = getattr(usage, "prompt_tokens", 0) or 0
+        tokens_out = getattr(usage, "completion_tokens", 0) or 0
+        cost_usd = calculate_cost(DEFAULT_MODEL, tokens_in, tokens_out)
         return LLMResponse(
             text=resp.choices[0].message.content,
-            tokens_in=getattr(usage, "prompt_tokens", 0) or 0,
-            tokens_out=getattr(usage, "completion_tokens", 0) or 0,
-            cost_usd=0.0,  # free tier
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=cost_usd,  # estimated at standard pricing
             latency_ms=latency_ms,
         )
