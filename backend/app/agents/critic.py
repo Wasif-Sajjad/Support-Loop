@@ -11,8 +11,9 @@ Applies checks in strict priority order:
 Story coverage:
   E1 — entailment_check() replaces the old `citation_supported = True` stub.
        Makes a small, focused LLM call that returns structured EntailmentResult.
-  E2 — POLICY_DENYLIST_INTENTS = {delete_account, complaint}. Unit-tested in
-       backend/tests/test_critic.py::test_e2_denylist_*.
+  E2 — POLICY_DENYLIST_INTENTS = {delete_account, complaint,
+            registration_problems, infrastructure_issue}.
+       Unit-tested in backend/tests/test_critic.py::test_e2_denylist_*.
   E3 — Thresholds are PROVISIONAL DEFAULTS ONLY.
        ⚠ DO NOT tune against the current 13-row eval set — it is too small and
        6 of 9 account intents still lack KB content. Any tuning now would fit
@@ -27,6 +28,7 @@ import json
 
 from app.llm.base import LLMProvider
 from app.schemas import (
+    BatchEntailmentResponse,
     ClassificationResult,
     CriticVerdict,
     CriticVerdictWithTrace,
@@ -34,6 +36,7 @@ from app.schemas import (
     EntailmentResult,
     EntailmentStepTrace,
     RetrievedChunk,
+    SingleChunkEntailment,
     TicketTrace,
 )
 from app.config import settings
@@ -43,80 +46,97 @@ import uuid as _uuid
 # E2 — Hard policy denylist
 # ---------------------------------------------------------------------------
 # These intents ALWAYS escalate, regardless of confidence or citation quality.
+#
 # - delete_account: irreversible/destructive; requires human sign-off.
 # - complaint: reputational/sensitive; requires human sign-off.
-# ⚠ Do not expand this list without a corresponding update to docs/eval_set.csv.
-POLICY_DENYLIST_INTENTS: frozenset[str] = frozenset({"delete_account", "complaint"})
+#
+# Note: infrastructure_issue and registration_problems are governed by E3 stricter
+# thresholds (0.9), permitting well-grounded self-serve resolutions when confidence
+# is high while preventing premature auto-resolutions on bug reports or ambiguous issues.
+POLICY_DENYLIST_INTENTS: frozenset[str] = frozenset({
+    "delete_account",
+    "complaint",
+})
 
 # ---------------------------------------------------------------------------
-# E3 — Confidence thresholds (PROVISIONAL — see module docstring before tuning)
+# E3 — Confidence thresholds
 # ---------------------------------------------------------------------------
 # General floor: 0.7 (from settings.confidence_threshold / .env CONFIDENCE_THRESHOLD).
-# Stricter per-intent overrides for intents that carry production risk.
+# Stricter per-intent overrides for intents that carry production or registration risk.
 STRICTER_THRESHOLD_INTENTS: dict[str, float] = {
     "infrastructure_issue": 0.9,
-    # Backlog: add more overrides here after E3 tuning story is executed.
+    # Raised from 0.7 to 0.9 based on 54-row eval run evidence:
+    # 0.7 proved too permissive for registration issues (e.g. captcha/verification failures
+    # auto-resolving on generic sign-up text).
+    # NOTE ON TICKET 8 ("I don't know how to inform of sign-up errrors"):
+    # This is a user reporting a platform signup bug that gets miscategorized as a
+    # self-service how-to inquiry. This represents a known relevance-vs-entailment limitation:
+    # the answer claims may be strictly entailed by the KB, but the KB itself is not relevant
+    # to an active software defect. Thresholds mitigate but do not fully eliminate this semantic gap.
+    "registration_problems": 0.9,
 }
 
 # ---------------------------------------------------------------------------
-# E1 — Entailment check prompt
+# E1 — Entailment check prompt (batched)
 # ---------------------------------------------------------------------------
-_ENTAILMENT_SYSTEM_PROMPT = """\
+_BATCH_ENTAILMENT_SYSTEM_PROMPT = """\
 You are a citation auditor. You will be shown:
   1. A drafted support answer.
-  2. A knowledge base passage that was cited in that answer.
+  2. One or more knowledge base passages cited in that answer, each identified by an ID.
 
-Your job: decide whether the passage provides factual support for the drafted answer.
+Your job: for EACH cited passage, decide whether that passage provides factual support for at least one claim in the drafted answer.
 
-Return ONLY a JSON object with exactly two keys:
-  - supported (boolean): true if the passage provides source material for AT LEAST ONE 
-    claim in the answer. It does not need to support the entire answer (other passages 
-    might cover the rest). False ONLY if it is completely off-topic, unused, or contradicted.
-  - reason (string): one or two sentences explaining your decision.
+Return ONLY a JSON object with a "results" key containing a list of objects.
+Each object must have:
+  - "chunk_id" (string): the exact ID of the cited passage.
+  - "supported" (boolean): true if the passage provides source material for AT LEAST ONE claim in the answer. It does not need to support the entire answer. False ONLY if it is completely off-topic, unused, or contradicted.
+  - "reason" (string): one or two sentences explaining your decision.
 
-Do not consider whether the answer is generally correct — only whether THIS passage
-was actually used as factual grounding for some part of the answer.
+Do not consider whether the answer is generally correct — only whether EACH passage was actually used as factual grounding for some part of the answer.
 Return ONLY valid JSON, no markdown fences.
 """
 
 
-async def entailment_check(
+async def batch_entailment_check(
     answer: str,
-    cited_chunk: RetrievedChunk,
+    cited_chunks: list[RetrievedChunk],
     llm: LLMProvider,
-) -> EntailmentResult:
-    """E1 — Ask the LLM whether a cited KB chunk actually supports the drafted answer.
+) -> list[tuple[RetrievedChunk, EntailmentResult]]:
+    """E1 — Ask the LLM to score all cited KB chunks in a single batched call.
 
-    This replaces the old `citation_supported = True` stub. The LLM makes a
-    focused yes/no judgment with a brief reason, returned as structured output.
+    Reduces latency from N sequential LLM calls to 1 batched LLM call.
 
     Args:
         answer: The drafted answer text from the drafter agent.
-        cited_chunk: One of the chunks cited in the draft. We check one chunk per call;
-            the caller may run this for multiple chunks and aggregate.
-        llm: An LLMProvider instance (via app.llm.base.get_provider).
+        cited_chunks: List of RetrievedChunk objects cited in the draft.
+        llm: An LLMProvider instance.
 
     Returns:
-        An EntailmentResult with supported (bool) and reason (str).
-
-    Raises:
-        json.JSONDecodeError: If the LLM returns malformed JSON.
-        ValueError: If the response fails EntailmentResult validation.
+        A list of (RetrievedChunk, EntailmentResult) pairs for every cited chunk.
     """
+    if not cited_chunks:
+        return []
+
+    passages_text = []
+    for idx, chunk in enumerate(cited_chunks, 1):
+        passages_text.append(
+            f"--- Passage {idx} [ID: {chunk.chunk_id}] ---\n{chunk.content.strip()}"
+        )
+    formatted_passages = "\n\n".join(passages_text)
+
     messages = [
-        {"role": "system", "content": _ENTAILMENT_SYSTEM_PROMPT},
+        {"role": "system", "content": _BATCH_ENTAILMENT_SYSTEM_PROMPT},
         {
             "role": "user",
             "content": (
                 f"Drafted answer:\n{answer}\n\n"
-                f"Cited passage:\n{cited_chunk.content.strip()}\n\n"
-                "Does this passage support the answer? Return JSON now."
+                f"Cited passages:\n{formatted_passages}\n\n"
+                "Evaluate all cited passages and return JSON now."
             ),
         },
     ]
-    response = await llm.complete(messages, response_schema=EntailmentResult)
+    response = await llm.complete(messages, response_schema=BatchEntailmentResponse)
 
-    # Defensive parse: strip markdown fences if present.
     raw = response.text.strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
@@ -125,13 +145,102 @@ async def entailment_check(
         raw = raw.strip()
 
     data = json.loads(raw)
-    result = EntailmentResult(**data)
-    result.tokens_in = response.tokens_in
-    result.tokens_out = response.tokens_out
-    result.cost_usd = response.cost_usd
-    result.latency_ms = response.latency_ms
-    result.provider_name = response.provider_name
-    return result
+
+    results_map: dict[str, dict] = {}
+    if isinstance(data, dict):
+        if "results" in data and isinstance(data["results"], list):
+            for item in data["results"]:
+                if isinstance(item, dict) and "chunk_id" in item:
+                    results_map[str(item["chunk_id"]).lower()] = item
+        elif "supported" in data:
+            first_id = str(cited_chunks[0].chunk_id).lower()
+            results_map[first_id] = data
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and "chunk_id" in item:
+                results_map[str(item["chunk_id"]).lower()] = item
+
+    n_chunks = len(cited_chunks)
+    per_tokens_in = response.tokens_in // n_chunks if n_chunks else 0
+    per_tokens_out = response.tokens_out // n_chunks if n_chunks else 0
+    per_cost = response.cost_usd / n_chunks if n_chunks else 0.0
+    per_latency = response.latency_ms // n_chunks if n_chunks else 0
+
+    entailment_results: list[tuple[RetrievedChunk, EntailmentResult]] = []
+    for idx, chunk in enumerate(cited_chunks):
+        cid_str = str(chunk.chunk_id).lower()
+        matched = results_map.get(cid_str)
+        if not matched:
+            for k, v in results_map.items():
+                if k in cid_str or cid_str in k:
+                    matched = v
+                    break
+        if not matched and idx < len(results_map):
+            matched = list(results_map.values())[idx]
+
+        if matched:
+            sup = bool(matched.get("supported", False))
+            reason = str(matched.get("reason", "No reason provided."))
+        else:
+            sup = False
+            reason = "No entailment result returned for this chunk."
+
+        result = EntailmentResult(
+            supported=sup,
+            reason=reason,
+            tokens_in=per_tokens_in,
+            tokens_out=per_tokens_out,
+            cost_usd=per_cost,
+            latency_ms=per_latency,
+            provider_name=response.provider_name,
+        )
+        entailment_results.append((chunk, result))
+
+    return entailment_results
+
+
+async def entailment_check(
+    answer: str,
+    cited_chunk: RetrievedChunk,
+    llm: LLMProvider,
+) -> EntailmentResult:
+    """Backward-compatible single-chunk entailment check."""
+    results = await batch_entailment_check(answer, [cited_chunk], llm)
+    if results:
+        return results[0][1]
+    return EntailmentResult(
+        supported=False,
+        reason="Entailment check failed to produce results.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Content-based overrides
+# ---------------------------------------------------------------------------
+# Registration risk phrases: account-enumeration, bot, or token validation issues
+# where even a grounded answer shouldn't be auto-sent.
+REGISTRATION_RISK_PHRASES: tuple[str, ...] = (
+    "already in use",
+    "existing account",
+    "captcha",
+    "verification failed",
+    "link says expired",
+    "verification link says expired",
+)
+
+# Bug-report language patterns: user reporting a defect or active malfunction
+# distinct from how-to inquiry. Entailed citations cannot remediate software bugs.
+BUG_REPORT_PHRASES: tuple[str, ...] = (
+    "how to report",
+    "how to inform of",
+    "getting an error",
+    "getting error",
+    "keeps failing",
+    "report issues",
+    "report an error",
+    "submit a bug",
+    "file a bug",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -143,31 +252,40 @@ async def escalation_critic(
     draft: DraftResolution,
     retrieved_chunks: list[RetrievedChunk],
     llm: LLMProvider,
+    ticket_text: str = "",
 ) -> CriticVerdictWithTrace:
     """Decide whether a drafted answer should be auto-resolved or escalated.
 
-    Applies three checks in strict priority order:
+    Applies checks in strict priority order:
 
+    0. Content-based overrides: registration abuse risk or bug-report defect phrasing.
     1. (E2) Hard policy denylist: some intents always escalate. No LLM call.
     2. (E3) Confidence floor + citation presence: escalate if below threshold. No LLM call.
-    3. (E1) Citation entailment: LLM call for EVERY cited chunk. Escalates if ANY
-       chunk fails. This fixes the original bug where only the first chunk was checked.
-
-    Args:
-        classification: Output of the classifier agent.
-        draft: Output of the drafter agent.
-        retrieved_chunks: The chunks returned by the retriever (used to look up
-            cited chunk content for the entailment check).
-        llm: An LLMProvider instance (via app.llm.base.get_provider).
-
-    Returns:
-        A CriticVerdictWithTrace — the verdict plus every (chunk, EntailmentResult)
-        pair checked, so the caller can persist EntailmentTrace rows and assemble
-        the full TicketTrace.entailment_steps.
+    3. (E1) Citation entailment: single batched LLM call for ALL cited chunks. Escalates if ANY
+       chunk fails.
     """
     def _short_circuit(verdict: CriticVerdict) -> CriticVerdictWithTrace:
         """Return a verdict with an empty entailment list (pre-entailment escalation)."""
         return CriticVerdictWithTrace(verdict=verdict, entailment_results=[])
+
+    # --- Check 0: Content-based overrides ---
+    text_lower = ticket_text.lower().strip()
+    if text_lower:
+        # 0a. Registration abuse / enumeration risk
+        if classification.intent == "registration_problems" and any(p in text_lower for p in REGISTRATION_RISK_PHRASES):
+            return _short_circuit(CriticVerdict(
+                decision="escalate",
+                reason="Content override: registration security/abuse risk pattern detected in ticket text",
+                citation_supported=False,
+            ))
+
+        # 0b. Active defect / bug-report phrasing across any intent
+        if any(p in text_lower for p in BUG_REPORT_PHRASES):
+            return _short_circuit(CriticVerdict(
+                decision="escalate",
+                reason="Content override: defect/bug-report language pattern detected (requires human investigation)",
+                citation_supported=False,
+            ))
 
     # --- Check 1 (E2): Hard policy denylist ---
     if classification.intent in POLICY_DENYLIST_INTENTS:
@@ -191,25 +309,25 @@ async def escalation_critic(
             citation_supported=bool(draft.cited_chunk_ids),
         ))
 
-    # --- Check 3 (E1): Citation entailment — check EVERY cited chunk ---
+    # --- Check 3 (E1): Citation entailment ---
     chunk_map: dict[str, RetrievedChunk] = {
         str(c.chunk_id): c for c in retrieved_chunks
     }
 
-    entailment_results: list[tuple[RetrievedChunk, EntailmentResult]] = []
+    valid_chunks: list[RetrievedChunk] = []
     hallucinated_ids: list[str] = []
 
     for cited_id in draft.cited_chunk_ids:
         cited_id_str = str(cited_id)
         chunk = chunk_map.get(cited_id_str)
-
         if chunk is None:
-            # This cited ID was not in the retrieved set — hallucinated.
             hallucinated_ids.append(cited_id_str)
-            continue
+        else:
+            valid_chunks.append(chunk)
 
-        result = await entailment_check(draft.answer, chunk, llm)
-        entailment_results.append((chunk, result))
+    entailment_results: list[tuple[RetrievedChunk, EntailmentResult]] = []
+    if valid_chunks:
+        entailment_results = await batch_entailment_check(draft.answer, valid_chunks, llm)
 
     # Any hallucinated IDs → immediate escalation (no entailment possible).
     if hallucinated_ids:

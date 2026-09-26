@@ -8,11 +8,11 @@ from app.llm.pricing import calculate_cost
 
 # Available free-tier models on Groq (as of 2026-09):
 #   openai/gpt-oss-120b   ← best quality, free
-#   openai/gpt-oss-20b    ← faster, lighter
-#   qwen/qwen3.8-27b      ← alternative
+#   openai/gpt-oss-20b    ← faster, lighter (CURRENT — reverted 2026-09-21)
+#   qwen/qwen3.8-27b      ← alternative (caused ITPM exhaustion at eval scale)
 #   groq/compound         ← compound model
 # Update DEFAULT_MODEL here if Groq retires a model.
-DEFAULT_MODEL = "openai/gpt-oss-120b"
+DEFAULT_MODEL = "openai/gpt-oss-20b"
 
 
 class GroqProvider(LLMProvider):
@@ -27,6 +27,7 @@ class GroqProvider(LLMProvider):
         resp = await self.client.chat.completions.create(
             model=DEFAULT_MODEL,
             messages=messages,
+            max_tokens=1500,
             **kwargs,
         )
         latency_ms = int((time.monotonic() - start) * 1000)

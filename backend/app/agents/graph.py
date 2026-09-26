@@ -279,6 +279,7 @@ def build_graph(db: AsyncSession, llm: LLMProvider):
             draft,
             retrieved_chunks=state.get("retrieved_chunks", []),
             llm=llm,
+            ticket_text=state.get("ticket_text", ""),
         )
         verdict = result.verdict
         entailment_results = result.entailment_results

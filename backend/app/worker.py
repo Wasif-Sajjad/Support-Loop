@@ -102,5 +102,5 @@ class WorkerSettings:
     """Configuration class for arq CLI: arq app.worker.WorkerSettings"""
     functions = [process_ticket_job]
     redis_settings = get_redis_settings()
-    max_jobs = 10
-    job_timeout = 120
+    max_jobs = 2
+    job_timeout = 300

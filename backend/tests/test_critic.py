@@ -8,8 +8,10 @@ Test coverage by story:
        Also asserts multi-chunk: all cited chunks checked, not just the first.
 
   E2 — Denylist: pure unit tests, no LLM required.
-       test_e2_denylist_delete_account  — delete_account always escalates.
-       test_e2_denylist_complaint       — complaint always escalates.
+       test_e2_denylist_delete_account          — delete_account always escalates.
+       test_e2_denylist_complaint               — complaint always escalates.
+       test_e2_denylist_registration_problems   — registration_problems always escalates.
+       test_e2_denylist_infrastructure_issue    — infrastructure_issue always escalates.
        test_e2_non_denylist_passes_denylist_check — recover_password is not denylisted.
 
   E3 — Threshold unit tests: pure, no LLM.
@@ -118,11 +120,13 @@ async def test_e2_denylist_complaint() -> None:
 
 
 @pytest.mark.asyncio
-async def test_e2_non_denylist_intent_not_blocked_by_denylist() -> None:
-    """E2: recover_password is NOT in the denylist — should not escalate at step 1."""
+async def test_e2_non_denylist_intents_not_blocked_by_denylist() -> None:
+    """E2: registration_problems, infrastructure_issue, recover_password not in denylist."""
+    assert "delete_account" in POLICY_DENYLIST_INTENTS
+    assert "complaint" in POLICY_DENYLIST_INTENTS
+    assert "registration_problems" not in POLICY_DENYLIST_INTENTS
+    assert "infrastructure_issue" not in POLICY_DENYLIST_INTENTS
     assert "recover_password" not in POLICY_DENYLIST_INTENTS
-    # We don't assert the final decision here (entailment step needs a real LLM).
-    # This just verifies the denylist set is correct.
 
 
 # ---------------------------------------------------------------------------
@@ -149,14 +153,14 @@ async def test_e3_low_confidence_escalates() -> None:
 
 @pytest.mark.asyncio
 async def test_e3_infra_strict_threshold_escalates_at_low_conf() -> None:
-    """E3: infrastructure_issue requires ≥ 0.9. Confidence of 0.85 must escalate."""
-    assert STRICTER_THRESHOLD_INTENTS["infrastructure_issue"] == 0.9
+    """E3: infrastructure_issue uses 0.9 threshold — confidence 0.85 must escalate at E3."""
+    assert "infrastructure_issue" not in POLICY_DENYLIST_INTENTS
     chunk = _chunk("Run kubectl describe pod <name> to see events.")
     cid = chunk.chunk_id
     draft = _draft(
         answer="Run kubectl describe pod to diagnose the issue.",
         chunk_ids=[cid],
-        confidence=0.85,  # above default 0.7 but below infra's 0.9
+        confidence=0.85,  # < 0.9 threshold
     )
     result = await escalation_critic(
         _classification("infrastructure_issue", category="INFRA"),
@@ -165,6 +169,29 @@ async def test_e3_infra_strict_threshold_escalates_at_low_conf() -> None:
         llm=None,  # type: ignore[arg-type]
     )
     assert result.verdict.decision == "escalate"
+    assert "0.9" in result.verdict.reason or "threshold" in result.verdict.reason.lower()
+    assert result.entailment_results == []
+
+
+@pytest.mark.asyncio
+async def test_e3_registration_problems_threshold() -> None:
+    """E3: registration_problems uses strict 0.9 threshold — confidence 0.85 escalates."""
+    assert "registration_problems" not in POLICY_DENYLIST_INTENTS
+    chunk = _chunk("Check your spam folder for verification email.")
+    cid = chunk.chunk_id
+    draft = _draft(
+        answer="Check your spam folder.",
+        chunk_ids=[cid],
+        confidence=0.85,  # < 0.9 threshold
+    )
+    result = await escalation_critic(
+        _classification("registration_problems"),
+        draft,
+        retrieved_chunks=[chunk],
+        llm=None,  # type: ignore[arg-type]
+    )
+    assert result.verdict.decision == "escalate"
+    assert "0.9" in result.verdict.reason or "threshold" in result.verdict.reason.lower()
     assert result.entailment_results == []
 
 
@@ -180,6 +207,44 @@ async def test_e3_no_citations_escalates() -> None:
     )
     assert result.verdict.decision == "escalate"
     assert result.verdict.citation_supported is False
+    assert result.entailment_results == []
+
+
+# ---------------------------------------------------------------------------
+# Content-based override unit tests (no LLM required)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_content_override_registration_abuse() -> None:
+    """Registration risk phrases force escalation even with 0.99 confidence."""
+    chunk = _chunk("Email already in use troubleshooting steps.")
+    draft = _draft(answer="Log in instead.", chunk_ids=[chunk.chunk_id], confidence=0.99)
+    result = await escalation_critic(
+        _classification("registration_problems"),
+        draft,
+        retrieved_chunks=[chunk],
+        llm=None,  # type: ignore[arg-type]
+        ticket_text="getting error email already in use when trying to register",
+    )
+    assert result.verdict.decision == "escalate"
+    assert "Content override" in result.verdict.reason
+    assert result.entailment_results == []
+
+
+@pytest.mark.asyncio
+async def test_content_override_bug_report() -> None:
+    """Bug-report phrasing forces escalation regardless of intent and confidence."""
+    chunk = _chunk("General support knowledge.")
+    draft = _draft(answer="Here is how to submit.", chunk_ids=[chunk.chunk_id], confidence=0.95)
+    result = await escalation_critic(
+        _classification("registration_problems"),
+        draft,
+        retrieved_chunks=[chunk],
+        llm=None,  # type: ignore[arg-type]
+        ticket_text="I don't know how to inform of sign-up errrors",
+    )
+    assert result.verdict.decision == "escalate"
+    assert "Content override" in result.verdict.reason
     assert result.entailment_results == []
 
 
@@ -203,7 +268,7 @@ class _MockLLM(LLMProvider):
 
 @pytest.mark.asyncio
 async def test_e1_multi_chunk_all_checked_unit_escalates_if_any_fails() -> None:
-    """E1 regression unit test: With 2 cited chunks, BOTH must be checked.
+    """E1 regression unit test: With 2 cited chunks, BOTH must be checked in a single batched call.
     If chunk 1 passes but chunk 2 fails entailment, critic MUST escalate.
     Runs in standard CI without live LLM credentials.
     """
@@ -211,8 +276,20 @@ async def test_e1_multi_chunk_all_checked_unit_escalates_if_any_fails() -> None:
     bad_chunk = _chunk("To configure a Kubernetes pod, edit the pod spec YAML.")
 
     mock_llm = _MockLLM([
-        {"supported": True, "reason": "Chunk explains how to reset password."},
-        {"supported": False, "reason": "Chunk is about Kubernetes pods, not passwords."},
+        {
+            "results": [
+                {
+                    "chunk_id": str(good_chunk.chunk_id),
+                    "supported": True,
+                    "reason": "Chunk explains how to reset password.",
+                },
+                {
+                    "chunk_id": str(bad_chunk.chunk_id),
+                    "supported": False,
+                    "reason": "Chunk is about Kubernetes pods, not passwords.",
+                },
+            ]
+        }
     ])
 
     draft = _draft(
@@ -228,9 +305,9 @@ async def test_e1_multi_chunk_all_checked_unit_escalates_if_any_fails() -> None:
         llm=mock_llm,
     )
 
-    # 1. Verify that BOTH cited chunks were passed to the LLM (no early break on first pass)
-    assert len(mock_llm.calls) == 2, (
-        f"Expected LLM to be called twice (once per cited chunk), but was called {len(mock_llm.calls)} times."
+    # 1. Verify that BOTH cited chunks were passed in a SINGLE batched LLM call
+    assert len(mock_llm.calls) == 1, (
+        f"Expected LLM to be called once (batched), but was called {len(mock_llm.calls)} times."
     )
     assert len(result.entailment_results) == 2, "Both chunks must be present in entailment_results."
 
@@ -253,8 +330,20 @@ async def test_e1_multi_chunk_all_checked_unit_auto_resolves_if_all_pass() -> No
     chunk_b = _chunk("Step 2: Enter your email address to receive reset link.")
 
     mock_llm = _MockLLM([
-        {"supported": True, "reason": "Covers navigation to sign-in page."},
-        {"supported": True, "reason": "Covers entering email address."},
+        {
+            "results": [
+                {
+                    "chunk_id": str(chunk_a.chunk_id),
+                    "supported": True,
+                    "reason": "Covers navigation to sign-in page.",
+                },
+                {
+                    "chunk_id": str(chunk_b.chunk_id),
+                    "supported": True,
+                    "reason": "Covers entering email address.",
+                },
+            ]
+        }
     ])
 
     draft = _draft(
@@ -270,7 +359,7 @@ async def test_e1_multi_chunk_all_checked_unit_auto_resolves_if_all_pass() -> No
         llm=mock_llm,
     )
 
-    assert len(mock_llm.calls) == 2
+    assert len(mock_llm.calls) == 1
     assert len(result.entailment_results) == 2
     assert result.verdict.decision == "auto_resolve"
     assert result.verdict.citation_supported is True

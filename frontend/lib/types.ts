@@ -91,6 +91,7 @@ export interface ProviderCostMetrics {
   cost_usd: number;
   avg_latency_ms: number;
   pricing_label: string;
+  model_name?: string;
 }
 
 export interface MetricsSummary {

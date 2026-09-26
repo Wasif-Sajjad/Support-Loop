@@ -40,16 +40,36 @@ class RetryFallbackProvider(LLMProvider):
     If all retries fail, attempts the fallback providers in order.
     """
     def __init__(
-        self, 
-        primary: LLMProvider, 
-        fallbacks: list[LLMProvider] | None = None, 
-        max_retries: int = 3, 
-        base_delay: float = 2.0
+        self,
+        primary: LLMProvider,
+        fallbacks: list[LLMProvider] | None = None,
+        max_retries: int = 5,
+        base_delay: float = 1.0,
     ):
         self.primary = primary
         self.fallbacks = fallbacks or []
         self.max_retries = max_retries
         self.base_delay = base_delay
+
+    @staticmethod
+    def _is_retryable(exc: Exception) -> bool:
+        """Return True only for transient errors worth retrying (rate-limit, server error).
+
+        400 / 401 / 404 errors mean the request itself is broken (bad model name,
+        wrong auth, invalid payload) — retrying will never help and wastes quota.
+        429 / 500 / 502 / 503 are transient and should be retried with backoff.
+        """
+        err_str = str(exc).lower()
+        # Fast-fail signals: bad request, unauthorized, payment/quota required, or not found
+        if any(marker in err_str for marker in ("400", "401", "402", "404", "bad request", "not found", "invalid model", "payment required", "payment_required")):
+            for code in ("error code: 400", "error code: 401", "error code: 402", "error code: 404",
+                         "status 400", "status 401", "status 402", "status 404",
+                         "http 400", "http 401", "http 402", "http 404",
+                         "bad request", "invalid model", "model not found",
+                         "payment required", "payment_required"):
+                if code in err_str:
+                    return False
+        return True
 
     @observe(as_type="generation")
     async def _run_provider(self, provider: LLMProvider, messages: list[dict], response_schema: type[BaseModel] | None) -> LLMResponse:
@@ -73,35 +93,64 @@ class RetryFallbackProvider(LLMProvider):
         )
         return response
 
-    async def complete(self, messages: list[dict], response_schema: type[BaseModel] | None = None) -> LLMResponse:
-        last_exception = None
-        
-        # Try primary with retries
-        for attempt in range(self.max_retries):
-            try:
-                return await self._run_provider(self.primary, messages, response_schema)
-            except Exception as e:
-                last_exception = e
-                if attempt < self.max_retries - 1:
-                    delay = self.base_delay * (2 ** attempt)
-                    logger.warning(f"LLM primary provider failed (attempt {attempt + 1}/{self.max_retries}): {e}. Retrying in {delay}s...")
-                    await asyncio.sleep(delay)
-                else:
-                    logger.error(f"LLM primary provider failed after {self.max_retries} attempts: {e}")
+    async def complete(
+        self, messages: list[dict], response_schema: type[BaseModel] | None = None
+    ) -> LLMResponse:
+        """Attempt primary provider with retries, then each fallback in order.
 
-        # Try fallbacks if any
-        for fallback in self.fallbacks:
-            logger.info(f"Attempting fallback to provider: {fallback.__class__.__name__}")
-            try:
-                return await self._run_provider(fallback, messages, response_schema)
-            except Exception as e:
-                last_exception = e
-                logger.error(f"Fallback provider {fallback.__class__.__name__} failed: {e}")
+        Non-retryable errors (400/401/404) skip all retries and move immediately
+        to the next provider so we don't burn quota on a structurally bad request.
+        """
+        last_exception: Exception | None = None
+
+        providers = [self.primary] + self.fallbacks
+        for provider in providers:
+            provider_label = provider.__class__.__name__
+            for attempt in range(self.max_retries):
+                try:
+                    return await self._run_provider(provider, messages, response_schema)
+                except Exception as e:
+                    last_exception = e
+                    if not self._is_retryable(e):
+                        logger.error(
+                            f"{provider_label}: non-retryable error — skipping all retries: {e}"
+                        )
+                        break  # move to next provider immediately
+
+                    delay = self.base_delay * (2 ** attempt)
+                    err_str = str(e)
+                    if "Please try again in" in err_str:
+                        try:
+                            hint = float(
+                                err_str.split("Please try again in")[1].split("s")[0].strip()
+                            )
+                            delay = max(delay, hint + 0.5)
+                        except Exception:
+                            pass
+
+                    if attempt < self.max_retries - 1:
+                        logger.warning(
+                            f"{provider_label} failed (attempt {attempt + 1}/{self.max_retries}): "
+                            f"{e}. Retrying in {delay:.1f}s..."
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error(
+                            f"{provider_label} exhausted after {self.max_retries} attempts: {e}"
+                        )
 
         raise RuntimeError("All LLM providers failed") from last_exception
 
 
 def _instantiate_provider(name: str) -> LLMProvider:
+    """Instantiate a named LLM provider by string key.
+
+    Args:
+        name: Provider identifier (groq | gemini | cerebras | ollama).
+
+    Returns:
+        Concrete LLMProvider instance.
+    """
     if name == "groq":
         from app.llm.groq_provider import GroqProvider
         return GroqProvider()
@@ -115,19 +164,33 @@ def _instantiate_provider(name: str) -> LLMProvider:
 
 
 def get_provider(name: str) -> LLMProvider:
-    """Factory — routes on the LLM_PROVIDER env var. Wraps the primary provider
-    in a RetryFallbackProvider so API failures (like 429s) are retried automatically.
+    """Factory — returns a RetryFallbackProvider wrapping primary → Gemini.
+
+    Fallback chain (when primary is groq):
+      1. Groq (primary, max_retries=5)
+      2. Gemini (1st fallback, if GEMINI_API_KEY is set)
+
+    Non-retryable errors (400/401/404) skip directly to the next provider.
+    Only 429/5xx errors are retried with exponential backoff.
+
+    Args:
+        name: Provider identifier from LLM_PROVIDER env var.
+
+    Returns:
+        RetryFallbackProvider wrapping the fallback chain.
     """
     from app.config import settings
 
     primary = _instantiate_provider(name)
-    fallbacks = []
+    fallbacks: list[LLMProvider] = []
 
-    # If using Groq and a Gemini key is available, add Gemini as a fallback
-    if name == "groq" and settings.gemini_api_key:
-        try:
-            fallbacks.append(_instantiate_provider("gemini"))
-        except Exception as e:
-            logger.warning(f"Failed to instantiate Gemini fallback: {e}")
+    if name == "groq":
+        # 1st fallback: Gemini
+        if settings.gemini_api_key:
+            try:
+                fallbacks.append(_instantiate_provider("gemini"))
+                logger.info("Gemini registered as 1st fallback provider.")
+            except Exception as e:
+                logger.warning(f"Failed to instantiate Gemini fallback: {e}")
 
     return RetryFallbackProvider(primary=primary, fallbacks=fallbacks)

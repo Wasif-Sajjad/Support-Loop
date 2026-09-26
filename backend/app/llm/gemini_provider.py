@@ -6,7 +6,8 @@ from app.config import settings
 from app.llm.base import LLMProvider, LLMResponse
 from app.llm.pricing import calculate_cost
 
-# Free tier: aistudio.google.com — no card required (verify current daily/RPM limits).
+# Free tier: aistudio.google.com — no card required.
+# Verified active on Google AI Studio: gemini-3.6-flash.
 DEFAULT_MODEL = "gemini-3.6-flash"
 
 

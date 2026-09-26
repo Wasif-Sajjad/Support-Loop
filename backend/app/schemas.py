@@ -3,6 +3,7 @@ Per AGENTS.md: no agent may return free text as a final output; everything goes
 through one of these models first.
 """
 import uuid
+from datetime import datetime
 from pydantic import BaseModel, Field
 
 
@@ -77,13 +78,28 @@ class EntailmentResult(BaseModel):
     provider_name: str = "unknown"
 
 
+class SingleChunkEntailment(BaseModel):
+    chunk_id: str
+    supported: bool
+    reason: str
+
+
+class BatchEntailmentResponse(BaseModel):
+    results: list[SingleChunkEntailment]
+
+
 class TicketResponse(BaseModel):
     id: uuid.UUID
+    raw_text: str | None = None
     status: str
     intent: str | None = None
     category: str | None = None
+    classifier_confidence: float | None = None
     decision: str | None = None
     final_answer: str | None = None
+    cited_chunk_ids: list[str] | list[uuid.UUID] | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
     class Config:
         from_attributes = True

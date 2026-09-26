@@ -139,7 +139,7 @@ export default function DashboardPage() {
                 <div className="flex items-center justify-between">
                   <div className="font-medium text-xs text-text-primary flex items-center gap-2">
                     <span className="w-2 h-2 rounded-full bg-resolve" />
-                    Groq (Llama 3.3 70B) — Primary
+                    Groq ({metrics.provider_breakdown?.groq?.model_name || "Active"}) — Primary
                   </div>
                   <span className="font-mono text-[11px] text-text-secondary">
                     {metrics.provider_breakdown?.groq?.calls ?? 0} calls
@@ -172,7 +172,7 @@ export default function DashboardPage() {
                 <div className="flex items-center justify-between">
                   <div className="font-medium text-xs text-text-primary flex items-center gap-2">
                     <span className="w-2 h-2 rounded-full bg-escalate" />
-                    Gemini 1.5 Flash — Failover Fallback
+                    Gemini ({metrics.provider_breakdown?.gemini?.model_name || "Active"}) — Failover Fallback
                   </div>
                   <span className="font-mono text-[11px] text-text-secondary">
                     {metrics.provider_breakdown?.gemini?.calls ?? 0} calls

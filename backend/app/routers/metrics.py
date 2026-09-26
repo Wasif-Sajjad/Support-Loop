@@ -73,18 +73,43 @@ async def metrics_summary(db: AsyncSession = Depends(get_db)):
         entry["cost_usd"] = round(entry["cost_usd"] + (row.cost_usd or 0.0), 8)
         entry["total_latency_ms"] += row.latency_ms or 0
 
-    # Format provider stats with average latency
+    from app.llm.groq_provider import DEFAULT_MODEL as GROQ_MODEL
+    from app.llm.gemini_provider import DEFAULT_MODEL as GEMINI_MODEL
+
+    active_models = {
+        "groq": GROQ_MODEL,
+        "gemini": GEMINI_MODEL,
+    }
+
+    # Format provider stats with average latency and dynamic active model name
     formatted_providers = {}
-    for p_key, stats in provider_breakdown.items():
+    # Ensure both primary providers are present in the response
+    for key in ("groq", "gemini"):
+        stats = provider_breakdown.get(key, {"calls": 0, "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "total_latency_ms": 0})
         calls = stats["calls"]
-        formatted_providers[p_key] = {
+        formatted_providers[key] = {
             "calls": calls,
             "tokens_in": stats["tokens_in"],
             "tokens_out": stats["tokens_out"],
             "cost_usd": round(stats["cost_usd"], 6),
             "avg_latency_ms": int(stats["total_latency_ms"] / calls) if calls > 0 else 0,
             "pricing_label": COST_DISCLAIMER,
+            "model_name": active_models.get(key, key),
         }
+
+    # Include any additional providers from traces (e.g. cerebras, ollama)
+    for p_key, stats in provider_breakdown.items():
+        if p_key not in formatted_providers:
+            calls = stats["calls"]
+            formatted_providers[p_key] = {
+                "calls": calls,
+                "tokens_in": stats["tokens_in"],
+                "tokens_out": stats["tokens_out"],
+                "cost_usd": round(stats["cost_usd"], 6),
+                "avg_latency_ms": int(stats["total_latency_ms"] / calls) if calls > 0 else 0,
+                "pricing_label": COST_DISCLAIMER,
+                "model_name": active_models.get(p_key, p_key),
+            }
 
     return {
         "total_tickets": total,

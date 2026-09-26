@@ -29,12 +29,24 @@ PRICING_TABLE: dict[str, ModelPricing] = {
         "input_per_1k": 0.00059,
         "output_per_1k": 0.00079,
     },
+    "openai/gpt-oss-20b": {
+        "input_per_1k": 0.00020,
+        "output_per_1k": 0.00040,
+    },
+    "qwen/qwen3.8-27b": {
+        "input_per_1k": 0.00020,
+        "output_per_1k": 0.00040,
+    },
     # Gemini models
     "gemini": {
         "input_per_1k": 0.000075,
         "output_per_1k": 0.00030,
     },
     "gemini-1.5-flash": {
+        "input_per_1k": 0.000075,
+        "output_per_1k": 0.00030,
+    },
+    "gemini-3.5-flash": {
         "input_per_1k": 0.000075,
         "output_per_1k": 0.00030,
     },

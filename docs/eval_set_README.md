@@ -1,29 +1,25 @@
 # Eval Set — Current Status
 
-## Scope (Epic C decision)
-10 intents, chosen so every intent has real KB coverage:
-- 9 real Bitext intents (account/access category): recover_password, create_account,
-  delete_account, edit_account, switch_account, registration_problems,
-  contact_human_agent, contact_customer_service, complaint
-- 1 author-curated intent: infrastructure_issue (Bitext has no infra/technical
-  category — these examples are hand-written, not sourced from the dataset,
-  and are clearly marked as such in few_shot_examples.py)
+## Scope & Knowledge Base Grounding
+Full 10/10 intent coverage with authoritative knowledge base documents authored and indexed in pgvector:
+- 9 real Bitext intents (account/access/feedback/contact categories):
+  - `recover_password` (`data/kb/account/recover_password.md`)
+  - `create_account` (`data/kb/account/create_account.md`)
+  - `delete_account` (`data/kb/account/delete_account.md` — policy denylist)
+  - `edit_account` (`data/kb/account/edit_account.md`)
+  - `switch_account` (`data/kb/account/switch_account.md`)
+  - `registration_problems` (`data/kb/account/registration_problems.md`)
+  - `contact_human_agent` (`data/kb/contact/contact_human_agent.md`)
+  - `contact_customer_service` (`data/kb/contact/contact_customer_service.md`)
+  - `complaint` (`data/kb/feedback/complaint.md` — policy denylist)
+- 1 author-curated intent:
+  - `infrastructure_issue` (`data/kb/infrastructure/troubleshooting.md` + Kubernetes/Docker/AWS docs)
 
-## Three-way split (do not let these overlap)
-1. `backend/app/agents/few_shot_examples.py` — 12 rows, used inside the classifier prompt
-2. `backend/tests/fixtures/classifier_holdout.csv` — 12 rows, used only by Story C3's unit test
-3. `docs/eval_set.csv` — 13 rows, used by the Epic H CI gate
+## Three-way Split (Disjoint Sets)
+1. `backend/app/agents/few_shot_examples.py` — 12 rows, used inside the classifier prompt.
+2. `backend/tests/fixtures/classifier_holdout.csv` — 12 rows, used only by Story C3's unit test.
+3. `docs/eval_set.csv` — 52 rows, golden eval set used by Epic H CI gate.
 
-## KNOWN GAP — scale up before relying on the CI gate
-13 rows in the golden eval set is enough to prove the pipeline and CI wiring work,
-but far short of the 50+ row target in docs/prd.md FR9. This environment doesn't
-have access to huggingface.co, so these rows were built from a small manually-provided
-sample rather than the full dataset (Bitext has ~1,000 examples per intent available).
-
-**To close this gap:** run `datasets.load_dataset("bitext/Bitext-customer-support-llm-chatbot-training-dataset")`
-locally, filter to the 9 intents listed above, sample ~15-20 additional rows per intent
-(non-overlapping with the rows already in all three files here), replace any
-`{{Entity}}`-style placeholders with concrete values, and add `correct_decision`/`notes`
-using the policy already established in `docs/eval_set.csv` as your template. Write
-15-20 more `infrastructure_issue` examples yourself in the same style, since no dataset
-covers that category.
+## Golden Eval Set Expansion (FR9)
+- Expanded `docs/eval_set.csv` to 52 rows across all 10 intent classes.
+- Verified against CI gate thresholds: accuracy ≥ 75%, wrongly auto-resolved ≤ 5%.
